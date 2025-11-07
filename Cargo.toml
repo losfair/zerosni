@@ -3,7 +3,11 @@ name = "zerosni"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+panic = "abort"
+
 [dependencies]
+arc-swap = "1"
 bytes = "1"
 tls-parser = "0.12"
 monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "utils"] }
@@ -20,3 +24,4 @@ socket2 = { version = "0.5", features = ["all"] }
 url = "2"
 webpki-roots = "0.26"
 moka = { version = "0.12", features = ["future"] }
+signal-hook = "0.3"

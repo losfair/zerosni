@@ -1,5 +1,6 @@
 mod rule_table;
 
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use rule_table::RuleTable;
 use std::{
@@ -62,12 +63,11 @@ struct Cli {
   rule_table: Option<PathBuf>,
 }
 
-#[derive(Clone)]
 struct ProxyContext {
   doh: Arc<DohClient>,
   default_resolver: String,
   default_fwmark: Option<u32>,
-  rule_table: Option<Arc<RuleTable>>,
+  rule_table: Arc<ArcSwapOption<RuleTable>>,
 }
 
 struct RouteSelection {
@@ -79,6 +79,7 @@ impl ProxyContext {
   fn select_route(&self, hostname: &str) -> RouteSelection {
     let overrides = self
       .rule_table
+      .load_full()
       .as_ref()
       .and_then(|table| table.lookup(hostname));
     let resolver_url = overrides
@@ -160,11 +161,13 @@ async fn amain() -> Result<()> {
   let default_resolver = args.resolver.clone();
   let fwmark = args.fwmark.filter(|mark| *mark != 0);
   let doh = Arc::new(DohClient::new()?);
-  let rule_table = if let Some(path) = args.rule_table.as_ref() {
+  let rule_table_path = args.rule_table.clone();
+  let initial_rule_table = if let Some(path) = rule_table_path.as_ref() {
     Some(Arc::new(RuleTable::from_file(path)?))
   } else {
     None
   };
+  let rule_table = Arc::new(ArcSwapOption::from(initial_rule_table));
 
   eprintln!(
     "zerosni listening on {} (resolver: {})",
@@ -175,14 +178,21 @@ async fn amain() -> Result<()> {
     doh,
     default_resolver,
     default_fwmark: fwmark,
-    rule_table,
+    rule_table: rule_table.clone(),
   });
+
+  if let Some(path) = rule_table_path {
+    install_rule_table_reloader(rule_table, path);
+  }
   let listener = TcpListener::bind(args.listen)?;
 
   loop {
     let accepted = listener.accept().await;
     match accepted {
       Ok((stream, peer)) => {
+        if let Err(err) = stream.set_nodelay(true) {
+          eprintln!("failed to set nodelay on accepted stream: {err}");
+        }
         let ctx = ctx.clone();
         monoio::spawn(async move {
           if let Err(err) = handle_client(stream, peer, ctx).await {
@@ -194,6 +204,38 @@ async fn amain() -> Result<()> {
         eprintln!("accept error: {err}");
       }
     }
+  }
+}
+
+fn install_rule_table_reloader(rule_table: Arc<ArcSwapOption<RuleTable>>, path: PathBuf) {
+  use signal_hook::consts::signal::SIGHUP;
+  use signal_hook::iterator::Signals;
+
+  let path_display = path.display().to_string();
+  if let Err(err) = std::thread::Builder::new()
+    .name("zerosni-sighup".into())
+    .spawn(move || {
+      let mut signals = match Signals::new([SIGHUP]) {
+        Ok(sig) => sig,
+        Err(err) => {
+          eprintln!("failed to install SIGHUP handler: {err}");
+          return;
+        }
+      };
+      for _ in signals.forever() {
+        match RuleTable::from_file(&path) {
+          Ok(table) => {
+            rule_table.store(Some(Arc::new(table)));
+            eprintln!("reloaded rule table from {path_display}");
+          }
+          Err(err) => {
+            eprintln!("failed to reload rule table {path_display}: {err}");
+          }
+        }
+      }
+    })
+  {
+    eprintln!("failed to spawn rule-table reload handler: {err}");
   }
 }
 

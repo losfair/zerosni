@@ -14,7 +14,7 @@
 Start `zerosni`:
 
 ```bash
-zerosni --fwmark 1 --listen 0.0.0.0:1510 --resolver https://1.1.1.1
+zerosni --fwmark 1 --listen 0.0.0.0:1510 --resolver https://1.1.1.1/dns-query
 ```
 
 To override the resolver and/or fwmark for specific hostnames, pass `--rule-table PATH` with a JSON rule file (see `examples/rule_table.json`).
@@ -25,8 +25,8 @@ The table maps hostname patterns to overrides:
 
 ```json
 {
-  "www.example.com": { "resolver": "https://8.8.8.8", "fwmark": 1 },
-  "*.apple.com": { "resolver": "https://1.1.1.1" },
+  "www.example.com": { "resolver": "https://8.8.8.8/resolve", "fwmark": 1 },
+  "*.apple.com": { "resolver": "https://1.1.1.1/dns-query" },
   "*": { "fwmark": 3 }
 }
 ```
@@ -35,6 +35,12 @@ The table maps hostname patterns to overrides:
 - Wildcards must either be `*` (catch-all) or start with `*.` to match any subdomain of the suffix (e.g. `*.example.com`).
 - Each rule must set at least one of `resolver` or `fwmark`.
 - Missing fields fall back to the global `--resolver` / `--fwmark` configuration.
+
+## Hot reloading
+
+When running with `--rule-table`, send the process `SIGHUP` to reload the JSON
+file without restarting. The updated table replaces the previous one atomically,
+so new connections immediately see the refreshed overrides.
 
 Set up iptables
 
