@@ -17,6 +17,25 @@ Start `zerosni`:
 zerosni --fwmark 1 --listen 0.0.0.0:1510 --resolver https://1.1.1.1
 ```
 
+To override the resolver and/or fwmark for specific hostnames, pass `--rule-table PATH` with a JSON rule file (see `examples/rule_table.json`).
+
+## Rule table format
+
+The table maps hostname patterns to overrides:
+
+```json
+{
+  "www.example.com": { "resolver": "https://8.8.8.8", "fwmark": 1 },
+  "*.apple.com": { "resolver": "https://1.1.1.1" },
+  "*": { "fwmark": 3 }
+}
+```
+
+- Exact hostnames are matched case-insensitively first.
+- Wildcards must either be `*` (catch-all) or start with `*.` to match any subdomain of the suffix (e.g. `*.example.com`).
+- Each rule must set at least one of `resolver` or `fwmark`.
+- Missing fields fall back to the global `--resolver` / `--fwmark` configuration.
+
 Set up iptables
 
 ```bash

@@ -1,0 +1,12 @@
+{
+    "www.example.com": {
+        "resolver": "https://8.8.8.8",
+        "fwmark": 1
+    },
+    "*.apple.com": {
+        "resolver": "https://1.1.1.1"
+    },
+    "*": {
+        "fwmark": 3
+    }
+}

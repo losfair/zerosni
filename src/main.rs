@@ -1,11 +1,15 @@
+mod rule_table;
+
 use bytes::Bytes;
+use rule_table::RuleTable;
 use std::{
-  collections::HashSet,
+  collections::{HashMap, HashSet},
   io,
   net::{IpAddr, SocketAddr, ToSocketAddrs},
   os::fd::{AsRawFd, RawFd},
+  path::PathBuf,
   str,
-  sync::{Arc, OnceLock},
+  sync::{Arc, Mutex, OnceLock},
   time::Duration,
 };
 
@@ -53,25 +57,59 @@ struct Cli {
   /// Firewall mark to apply to outbound sockets (Linux only).
   #[arg(long)]
   fwmark: Option<u32>,
+  /// Path to a JSON rule table that overrides resolver/fwmark per hostname.
+  #[arg(long = "rule-table")]
+  rule_table: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct ProxyContext {
-  resolver: Arc<DohClient>,
+  doh: Arc<DohClient>,
+  default_resolver: String,
+  default_fwmark: Option<u32>,
+  rule_table: Option<Arc<RuleTable>>,
+}
+
+struct RouteSelection {
+  resolver_url: String,
   fwmark: Option<u32>,
 }
 
-#[derive(Clone)]
+impl ProxyContext {
+  fn select_route(&self, hostname: &str) -> RouteSelection {
+    let overrides = self
+      .rule_table
+      .as_ref()
+      .and_then(|table| table.lookup(hostname));
+    let resolver_url = overrides
+      .as_ref()
+      .and_then(|rule| rule.resolver.clone())
+      .unwrap_or_else(|| self.default_resolver.clone());
+    let fwmark = overrides
+      .as_ref()
+      .and_then(|rule| rule.fwmark)
+      .or(self.default_fwmark);
+    RouteSelection {
+      resolver_url,
+      fwmark,
+    }
+  }
+}
+
 struct DohClient {
   connector: TlsConnector,
+  cache: &'static Cache<String, Vec<IpAddr>>,
+  resolvers: Mutex<HashMap<String, Arc<ResolverConfig>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolverConfig {
   server_name: ServerName<'static>,
   host: String,
   port: u16,
   authority: String,
   path: String,
   base_query: Vec<(String, String)>,
-  display: String,
-  cache: &'static Cache<String, Vec<IpAddr>>,
 }
 
 #[derive(Clone, Copy)]
@@ -119,15 +157,26 @@ fn main() -> Result<()> {
 async fn amain() -> Result<()> {
   let args = Cli::parse();
 
+  let default_resolver = args.resolver.clone();
   let fwmark = args.fwmark.filter(|mark| *mark != 0);
-  let resolver = Arc::new(DohClient::new(&args.resolver)?);
+  let doh = Arc::new(DohClient::new()?);
+  let rule_table = if let Some(path) = args.rule_table.as_ref() {
+    Some(Arc::new(RuleTable::from_file(path)?))
+  } else {
+    None
+  };
 
   eprintln!(
     "zerosni listening on {} (resolver: {})",
-    args.listen, resolver.display
+    args.listen, default_resolver
   );
 
-  let ctx = Arc::new(ProxyContext { resolver, fwmark });
+  let ctx = Arc::new(ProxyContext {
+    doh,
+    default_resolver,
+    default_fwmark: fwmark,
+    rule_table,
+  });
   let listener = TcpListener::bind(args.listen)?;
 
   loop {
@@ -156,9 +205,14 @@ async fn handle_client(
   let hello = capture_client_hello(&mut client).await?;
   eprintln!("{peer} requested {}", hello.hostname);
 
+  let RouteSelection {
+    resolver_url,
+    fwmark,
+  } = ctx.select_route(&hello.hostname);
+
   let candidates = ctx
-    .resolver
-    .resolve(&hello.hostname, ctx.fwmark)
+    .doh
+    .resolve(&resolver_url, &hello.hostname, fwmark)
     .await
     .with_context(|| format!("resolver lookup for {}", hello.hostname))?;
 
@@ -166,7 +220,7 @@ async fn handle_client(
     bail!("no DNS answers for {}", hello.hostname);
   }
 
-  let upstream = connect_to_any(&candidates, ctx.fwmark).await?;
+  let upstream = connect_to_any(&candidates, fwmark).await?;
 
   relay_streams(client, upstream, hello.buffer).await?;
   Ok(())
@@ -264,39 +318,14 @@ async fn relay_streams(client: TcpStream, upstream: TcpStream, initial: Vec<u8>)
 }
 
 impl DohClient {
-  fn new(uri: &str) -> Result<Self> {
+  fn new() -> Result<Self> {
     install_crypto_provider()?;
 
-    let mut url = Url::parse(uri).context("invalid resolver URL")?;
-    if url.scheme() != "https" {
-      bail!("resolver URL must use https://");
-    }
-    if url.path().is_empty() || url.path() == "/" {
-      url.set_path(DEFAULT_DOH_PATH);
-    }
-    let host = url
-      .host_str()
-      .ok_or_else(|| anyhow!("resolver URL missing host"))?
-      .to_string();
-    let port = url
-      .port_or_known_default()
-      .ok_or_else(|| anyhow!("resolver URL missing port"))?;
-    let authority = if port == 443 {
-      host.clone()
-    } else {
-      format!("{host}:{port}")
-    };
     let root_store = RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned());
     let config = ClientConfig::builder()
       .with_root_certificates(root_store)
       .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(host.clone())
-      .map_err(|_| anyhow!("resolver host is not a valid TLS name"))?;
-    let base_query = url
-      .query_pairs()
-      .map(|(k, v)| (k.into_owned(), v.into_owned()))
-      .collect();
     let cache = &*Box::leak(Box::new(
       Cache::builder()
         .time_to_live(Duration::from_secs(DNS_CACHE_TTL_SECS))
@@ -322,26 +351,24 @@ impl DohClient {
 
     Ok(Self {
       connector,
-      server_name,
-      host,
-      port,
-      authority,
-      path: url.path().to_string(),
-      base_query,
-      display: url.to_string(),
       cache,
+      resolvers: Mutex::new(HashMap::new()),
     })
   }
 
-  async fn resolve(&self, hostname: &str, fwmark: Option<u32>) -> Result<Vec<IpAddr>> {
-    let key = hostname.to_ascii_lowercase();
+  async fn resolve(
+    &self,
+    resolver_url: &str,
+    hostname: &str,
+    fwmark: Option<u32>,
+  ) -> Result<Vec<IpAddr>> {
+    let resolver = self.get_resolver(resolver_url)?;
     let host = hostname.to_string();
     match self
       .cache
-      .try_get_with(
-        key,
-        async move { self.resolve_uncached(&host, fwmark).await },
-      )
+      .try_get_with(hostname.to_string(), async move {
+        self.resolve_uncached(resolver, &host, fwmark).await
+      })
       .await
     {
       Ok(addrs) => Ok(addrs),
@@ -352,11 +379,28 @@ impl DohClient {
     }
   }
 
-  async fn resolve_uncached(&self, hostname: &str, fwmark: Option<u32>) -> Result<Vec<IpAddr>> {
+  fn get_resolver(&self, uri: &str) -> Result<Arc<ResolverConfig>> {
+    let mut guard = self.resolvers.lock().expect("resolver cache poisoned");
+    if let Some(existing) = guard.get(uri) {
+      return Ok(existing.clone());
+    }
+    let config = Arc::new(ResolverConfig::parse(uri)?);
+    guard.insert(uri.to_string(), config.clone());
+    Ok(config)
+  }
+
+  async fn resolve_uncached(
+    &self,
+    resolver: Arc<ResolverConfig>,
+    hostname: &str,
+    fwmark: Option<u32>,
+  ) -> Result<Vec<IpAddr>> {
     let mut seen = HashSet::new();
     let mut addrs = Vec::new();
     for ty in [RecordType::A, RecordType::Aaaa] {
-      let mut records = self.query_rr(hostname, ty, fwmark).await?;
+      let mut records = self
+        .query_rr(resolver.as_ref(), hostname, ty, fwmark)
+        .await?;
       records.retain(|addr| seen.insert(*addr));
       addrs.extend(records);
     }
@@ -365,18 +409,19 @@ impl DohClient {
 
   async fn query_rr(
     &self,
+    resolver: &ResolverConfig,
     hostname: &str,
     ty: RecordType,
     fwmark: Option<u32>,
   ) -> Result<Vec<IpAddr>> {
-    let path = self.build_request_path(hostname, ty);
-    let tls = self.open_tls_stream(fwmark).await?;
+    let path = Self::build_request_path(resolver, hostname, ty);
+    let tls = self.open_tls_stream(resolver, fwmark).await?;
     let mut codec = ClientCodec::new(tls);
     let request = Request::builder()
       .method(Method::GET)
       .version(Version::HTTP_11)
       .uri(path)
-      .header(header::HOST, self.authority.as_str())
+      .header(header::HOST, resolver.authority.as_str())
       .header(header::USER_AGENT, USER_AGENT)
       .header(header::ACCEPT, "application/dns-json")
       .header(header::CONNECTION, "close")
@@ -419,29 +464,33 @@ impl DohClient {
     Ok(addrs)
   }
 
-  fn build_request_path(&self, hostname: &str, ty: RecordType) -> String {
+  fn build_request_path(resolver: &ResolverConfig, hostname: &str, ty: RecordType) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
-    for (k, v) in &self.base_query {
+    for (k, v) in &resolver.base_query {
       serializer.append_pair(k, v);
     }
     serializer.append_pair("name", hostname);
     serializer.append_pair("type", ty.label());
     let query = serializer.finish();
     if query.is_empty() {
-      self.path.clone()
+      resolver.path.clone()
     } else {
-      format!("{}?{}", self.path, query)
+      format!("{}?{}", resolver.path, query)
     }
   }
 
-  async fn open_tls_stream(&self, fwmark: Option<u32>) -> Result<ClientTlsStream<TcpStream>> {
+  async fn open_tls_stream(
+    &self,
+    resolver: &ResolverConfig,
+    fwmark: Option<u32>,
+  ) -> Result<ClientTlsStream<TcpStream>> {
     let mut last_err = None;
-    for addr in resolve_host(&self.host, self.port)? {
+    for addr in resolve_host(&resolver.host, resolver.port)? {
       match connect_with_mark(addr, fwmark).await {
         Ok(stream) => {
           return self
             .connector
-            .connect(self.server_name.clone(), stream)
+            .connect(resolver.server_name.clone(), stream)
             .await
             .map_err(Into::into);
         }
@@ -451,6 +500,44 @@ impl DohClient {
     let err = last_err
       .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "unable to resolve resolver host"));
     Err(err.into())
+  }
+}
+
+impl ResolverConfig {
+  fn parse(uri: &str) -> Result<Self> {
+    let mut url = Url::parse(uri).context("invalid resolver URL")?;
+    if url.scheme() != "https" {
+      bail!("resolver URL must use https://");
+    }
+    if url.path().is_empty() || url.path() == "/" {
+      url.set_path(DEFAULT_DOH_PATH);
+    }
+    let host = url
+      .host_str()
+      .ok_or_else(|| anyhow!("resolver URL missing host"))?
+      .to_string();
+    let port = url
+      .port_or_known_default()
+      .ok_or_else(|| anyhow!("resolver URL missing port"))?;
+    let authority = if port == 443 {
+      host.clone()
+    } else {
+      format!("{host}:{port}")
+    };
+    let server_name = ServerName::try_from(host.clone())
+      .map_err(|_| anyhow!("resolver host is not a valid TLS name"))?;
+    let base_query = url
+      .query_pairs()
+      .map(|(k, v)| (k.into_owned(), v.into_owned()))
+      .collect();
+    Ok(Self {
+      server_name,
+      host,
+      port,
+      authority,
+      path: url.path().to_string(),
+      base_query,
+    })
   }
 }
 
