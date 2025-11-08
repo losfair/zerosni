@@ -6,8 +6,9 @@ use rule_table::RuleTable;
 use std::{
   collections::{HashMap, HashSet},
   io,
+  mem::ManuallyDrop,
   net::{IpAddr, SocketAddr, ToSocketAddrs},
-  os::fd::{AsRawFd, RawFd},
+  os::fd::{AsRawFd, FromRawFd, RawFd},
   path::PathBuf,
   str,
   sync::{Arc, Mutex, OnceLock},
@@ -136,7 +137,7 @@ struct DohAnswer {
 }
 
 struct ClientHelloCapture {
-  hostname: String,
+  hostname: Option<String>,
   buffer: Vec<u8>,
 }
 
@@ -245,24 +246,34 @@ async fn handle_client(
   ctx: Arc<ProxyContext>,
 ) -> Result<()> {
   let hello = capture_client_hello(&mut client).await?;
-  eprintln!("{peer} requested {}", hello.hostname);
+  let socket = ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(client.as_raw_fd()) });
+  let upstream = if let Some(hostname) = &hello.hostname {
+    eprintln!("{peer} requested {}", hostname);
+    let RouteSelection {
+      resolver_url,
+      fwmark,
+    } = ctx.select_route(hostname);
 
-  let RouteSelection {
-    resolver_url,
-    fwmark,
-  } = ctx.select_route(&hello.hostname);
+    let candidates = ctx
+      .doh
+      .resolve(&resolver_url, hostname, fwmark)
+      .await
+      .with_context(|| format!("resolver lookup for {}", hostname))?;
 
-  let candidates = ctx
-    .doh
-    .resolve(&resolver_url, &hello.hostname, fwmark)
-    .await
-    .with_context(|| format!("resolver lookup for {}", hello.hostname))?;
+    if candidates.is_empty() {
+      bail!("no DNS answers for {}", hostname);
+    }
 
-  if candidates.is_empty() {
-    bail!("no DNS answers for {}", hello.hostname);
-  }
-
-  let upstream = connect_to_any(&candidates, fwmark).await?;
+    connect_to_any(&candidates, fwmark).await?
+  } else {
+    let original_dst = socket
+      .original_dst()?
+      .as_socket()
+      .with_context(|| "failed to get original_dst ip")?
+      .ip();
+    eprintln!("{peer} bypass {}", original_dst);
+    connect_to_any(&[original_dst], ctx.default_fwmark).await?
+  };
 
   relay_streams(client, upstream, hello.buffer).await?;
   Ok(())
@@ -271,42 +282,45 @@ async fn handle_client(
 async fn capture_client_hello(stream: &mut TcpStream) -> Result<ClientHelloCapture> {
   let mut captured = Vec::with_capacity(1024);
   let mut total = 0usize;
+  let peer_addr = stream.peer_addr()?;
 
-  loop {
-    let (hdr_res, header) = stream.read_exact(vec![0u8; 5]).await;
-    let header = header;
-    hdr_res.context("failed to read TLS record header")?;
-    total += header.len();
-    if total > MAX_CLIENT_HELLO_SIZE {
-      bail!("TLS ClientHello exceeds {MAX_CLIENT_HELLO_SIZE} bytes");
-    }
-    captured.extend_from_slice(&header);
-    if header[0] != 0x16 {
-      bail!("connection does not begin with a TLS handshake");
-    }
-    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    let (payload_res, payload) = stream.read_exact(vec![0u8; len]).await;
-    let payload = payload;
-    payload_res.context("failed to read TLS record payload")?;
-    total += len;
-    if total > MAX_CLIENT_HELLO_SIZE {
-      bail!("TLS ClientHello exceeds {MAX_CLIENT_HELLO_SIZE} bytes");
-    }
-    captured.extend_from_slice(&payload);
-
-    let start = captured.len() - (5 + len);
-    let record = &captured[start..];
-    let (_, plaintext) =
-      parse_tls_plaintext(record).map_err(|_| anyhow!("unable to parse TLS record"))?;
-    if let Some(hostname) = extract_sni(&plaintext) {
-      return Ok(ClientHelloCapture {
-        hostname,
-        buffer: captured,
-      });
-    } else {
-      bail!("TLS ClientHello did not include an SNI extension");
-    }
+  let (hdr_res, header) = stream.read_exact(vec![0u8; 5]).await;
+  hdr_res.context("failed to read TLS record header")?;
+  total += header.len();
+  if total > MAX_CLIENT_HELLO_SIZE {
+    bail!("TLS ClientHello exceeds {MAX_CLIENT_HELLO_SIZE} bytes");
   }
+  captured.extend_from_slice(&header);
+  if header[0] != 0x16 {
+    eprintln!("{peer_addr}: connection does not begin with a TLS handshake");
+
+    return Ok(ClientHelloCapture {
+      hostname: None,
+      buffer: captured,
+    });
+  }
+  let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+  let (payload_res, payload) = stream.read_exact(vec![0u8; len]).await;
+  let payload = payload;
+  payload_res.context("failed to read TLS record payload")?;
+  total += len;
+  if total > MAX_CLIENT_HELLO_SIZE {
+    bail!("TLS ClientHello exceeds {MAX_CLIENT_HELLO_SIZE} bytes");
+  }
+  captured.extend_from_slice(&payload);
+
+  let start = captured.len() - (5 + len);
+  let record = &captured[start..];
+  let (_, plaintext) =
+    parse_tls_plaintext(record).map_err(|_| anyhow!("unable to parse TLS record"))?;
+  let hostname = extract_sni(&plaintext);
+  if hostname.is_none() {
+    eprintln!("{peer_addr}: TLS ClientHello did not include an SNI extension",);
+  }
+  Ok(ClientHelloCapture {
+    hostname,
+    buffer: captured,
+  })
 }
 
 fn extract_sni(record: &TlsPlaintext) -> Option<String> {
