@@ -1,7 +1,8 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, io::Read, path::Path};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use struson::reader::{JsonReader, JsonStreamReader};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RuleOverride {
@@ -17,9 +18,9 @@ pub struct RuleTable {
 
 impl RuleTable {
   pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-    let data = fs::read_to_string(path.as_ref())
-      .with_context(|| format!("unable to read rule table {}", path.as_ref().display()))?;
-    Self::from_json_str(&data)
+    let mut file = std::fs::File::open(path.as_ref())
+      .with_context(|| format!("unable to open rule table {}", path.as_ref().display()))?;
+    Self::from_json_str(&mut file)
   }
 
   pub fn lookup(&self, hostname: &str) -> Option<RuleOverride> {
@@ -37,18 +38,16 @@ impl RuleTable {
     self.wildcard.get("").cloned()
   }
 
-  fn from_json_str(data: &str) -> Result<Self> {
-    let entries: HashMap<String, RuleOverride> = serde_json::from_str(data)
-      .context("rule table must be a JSON object mapping host patterns to rules")?;
-
-    if entries.is_empty() {
-      bail!("rule table must define at least one rule");
-    }
-
+  fn from_json_str(data: &mut impl Read) -> Result<Self> {
+    let mut reader = JsonStreamReader::new(data);
     let mut exact = HashMap::new();
     let mut wildcard = HashMap::new();
 
-    for (pattern, overrides) in entries {
+    reader.begin_object()?;
+
+    while reader.has_next()? {
+      let pattern = reader.next_name_owned()?;
+      let overrides: RuleOverride = reader.deserialize_next()?;
       let trimmed = pattern.trim();
       if trimmed.is_empty() {
         bail!("rule table contains an empty pattern");
@@ -72,6 +71,8 @@ impl RuleTable {
       }
       insert_unique(&mut exact, trimmed.to_ascii_lowercase(), overrides, trimmed)?;
     }
+
+    reader.end_object()?;
 
     Ok(Self { exact, wildcard })
   }

@@ -1,4 +1,5 @@
 mod rule_table;
+mod util;
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
@@ -7,7 +8,7 @@ use std::{
   collections::{HashMap, HashSet},
   io,
   mem::ManuallyDrop,
-  net::{IpAddr, SocketAddr, ToSocketAddrs},
+  net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
   os::fd::{AsRawFd, FromRawFd, RawFd},
   path::PathBuf,
   str,
@@ -39,6 +40,8 @@ use tls_parser::{
 };
 use url::{Url, form_urlencoded};
 use webpki_roots::TLS_SERVER_ROOTS;
+
+use crate::util::read_to_end;
 
 const DEFAULT_DOH_PATH: &str = "/dns-query";
 const MAX_CLIENT_HELLO_SIZE: usize = 64 * 1024;
@@ -245,10 +248,12 @@ async fn handle_client(
   peer: SocketAddr,
   ctx: Arc<ProxyContext>,
 ) -> Result<()> {
+  let peer_mac = lookup_peer_mac(peer.ip()).await;
+  let peer_log_label = format_peer_with_mac(peer, peer_mac.as_ref().map(|x| &***x));
   let hello = capture_client_hello(&mut client).await?;
   let socket = ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(client.as_raw_fd()) });
   let upstream = if let Some(hostname) = &hello.hostname {
-    eprintln!("{peer} requested {}", hostname);
+    eprintln!("{peer_log_label} requested {}", hostname);
     let RouteSelection {
       resolver_url,
       fwmark,
@@ -271,7 +276,7 @@ async fn handle_client(
       .as_socket()
       .with_context(|| "failed to get original_dst ip")?
       .ip();
-    eprintln!("{peer} bypass {}", original_dst);
+    eprintln!("{peer_log_label} bypass {}", original_dst);
     connect_to_any(&[original_dst], ctx.default_fwmark).await?
   };
 
@@ -400,6 +405,9 @@ impl DohClient {
           loop {
             monoio::time::sleep(Duration::from_secs(5)).await;
             cache.run_pending_tasks().await;
+            unsafe {
+              libc::malloc_trim(0);
+            }
           }
         })
       })
@@ -684,4 +692,53 @@ fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     format!("{host}:{port}")
   };
   target.to_socket_addrs().map(|iter| iter.collect())
+}
+
+fn format_peer_with_mac(peer: SocketAddr, mac: Option<&str>) -> String {
+  match mac {
+    Some(mac) => format!("{peer} (mac: {mac})"),
+    None => format!("{peer} (mac: unknown)"),
+  }
+}
+
+async fn lookup_peer_mac(addr: IpAddr) -> Option<Arc<String>> {
+  static CACHE: OnceLock<moka::future::Cache<Ipv4Addr, Option<Arc<String>>>> = OnceLock::new();
+  let cache = CACHE.get_or_init(|| {
+    moka::future::Cache::builder()
+      .time_to_live(Duration::from_secs(10))
+      .build()
+  });
+  let ip = match addr {
+    IpAddr::V4(ip) => ip,
+    IpAddr::V6(ip) => ip.to_ipv4_mapped()?,
+  };
+  cache.run_pending_tasks().await;
+  cache
+    .get_with(
+      ip,
+      async move { lookup_mac_from_arp(ip).await.map(Arc::new) },
+    )
+    .await
+}
+
+async fn lookup_mac_from_arp(needle: std::net::Ipv4Addr) -> Option<String> {
+  let contents = String::from_utf8(read_to_end("/proc/net/arp").await.ok()?).ok()?;
+  for line in contents.lines().skip(1) {
+    let mut fields = line.split_whitespace().into_iter();
+    let Some(ip) = fields.next().and_then(|x| x.parse::<Ipv4Addr>().ok()) else {
+      continue;
+    };
+    if ip != needle {
+      continue;
+    }
+    fields.next();
+    fields.next();
+    let Some(mac) = fields.next() else {
+      continue;
+    };
+    if mac != "00:00:00:00:00:00" {
+      return Some(mac.to_ascii_lowercase());
+    }
+  }
+  None
 }
