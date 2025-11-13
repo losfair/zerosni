@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Read, path::Path};
+use std::{collections::HashMap, io::Read, net::SocketAddr, path::Path};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -7,6 +7,7 @@ use struson::reader::{JsonReader, JsonStreamReader};
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RuleOverride {
   pub resolver: Option<String>,
+  pub direct: Option<SocketAddr>,
   pub fwmark: Option<u32>,
 }
 
@@ -52,9 +53,7 @@ impl RuleTable {
       if trimmed.is_empty() {
         bail!("rule table contains an empty pattern");
       }
-      if overrides.resolver.is_none() && overrides.fwmark.is_none() {
-        bail!("rule '{trimmed}' must specify at least one override");
-      }
+      validate_overrides(&overrides, trimmed)?;
       if trimmed == "*" {
         insert_unique(&mut wildcard, String::new(), overrides, trimmed)?;
         continue;
@@ -74,8 +73,22 @@ impl RuleTable {
 
     reader.end_object()?;
 
+    if exact.is_empty() && wildcard.is_empty() {
+      bail!("rule table must define at least one rule");
+    }
+
     Ok(Self { exact, wildcard })
   }
+}
+
+fn validate_overrides(overrides: &RuleOverride, pattern: &str) -> Result<()> {
+  if overrides.direct.is_some() && overrides.resolver.is_some() {
+    bail!("rule '{pattern}' cannot set both 'direct' and 'resolver'");
+  }
+  if overrides.direct.is_none() && overrides.resolver.is_none() && overrides.fwmark.is_none() {
+    bail!("rule '{pattern}' must specify at least one override");
+  }
+  Ok(())
 }
 
 fn insert_unique(
@@ -95,8 +108,13 @@ fn insert_unique(
 mod tests {
   use super::*;
 
+  fn parse_table(src: &str) -> Result<RuleTable> {
+    let mut cursor = std::io::Cursor::new(src.as_bytes());
+    RuleTable::from_json_str(&mut cursor)
+  }
+
   fn table(src: &str) -> RuleTable {
-    RuleTable::from_json_str(src).expect("valid table")
+    parse_table(src).expect("valid table")
   }
 
   #[test]
@@ -119,22 +137,45 @@ mod tests {
     let table = table(r#"{ "EXAMPLE.COM": { "resolver": "https://9.9.9.9" } }"#);
     let rule = table.lookup("Example.com").expect("match");
     assert_eq!(rule.resolver.as_deref(), Some("https://9.9.9.9"));
+    assert_eq!(rule.direct, None);
+    assert_eq!(rule.fwmark, None);
+  }
+
+  #[test]
+  fn direct_override_parses_address() {
+    let table = table(r#"{ "*.example.com": { "direct": "10.0.0.1:8443" } }"#);
+    let rule = table.lookup("www.example.com").expect("match");
+    assert_eq!(rule.direct, Some("10.0.0.1:8443".parse().unwrap()));
+    assert_eq!(rule.resolver, None);
     assert_eq!(rule.fwmark, None);
   }
 
   #[test]
   fn rejects_empty_table() {
-    let err = RuleTable::from_json_str("{}").unwrap_err();
+    let err = parse_table("{}").unwrap_err();
     assert!(err.to_string().contains("must define at least one rule"));
   }
 
   #[test]
   fn rejects_empty_override() {
-    let err = RuleTable::from_json_str(r#"{ "*": { } }"#).unwrap_err();
+    let err = parse_table(r#"{ "*": { } }"#).unwrap_err();
     assert!(
       err
         .to_string()
         .contains("must specify at least one override")
+    );
+  }
+
+  #[test]
+  fn rejects_direct_and_resolver() {
+    let err = parse_table(
+      r#"{ "www.example.com": { "direct": "10.0.0.1:8443", "resolver": "https://1.1.1.1" } }"#,
+    )
+    .unwrap_err();
+    assert!(
+      err
+        .to_string()
+        .contains("cannot set both 'direct' and 'resolver'")
     );
   }
 
@@ -153,7 +194,7 @@ mod tests {
 
   #[test]
   fn rejects_complex_wildcards() {
-    let err = RuleTable::from_json_str(r#"{ "api.*.example.*": { "fwmark": 5 } }"#).unwrap_err();
+    let err = parse_table(r#"{ "api.*.example.*": { "fwmark": 5 } }"#).unwrap_err();
     assert!(err.to_string().contains("unsupported wildcard pattern"));
   }
 }

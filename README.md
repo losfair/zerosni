@@ -17,7 +17,9 @@ Start `zerosni`:
 zerosni --fwmark 1 --listen 0.0.0.0:1510 --resolver https://1.1.1.1/dns-query
 ```
 
-To override the resolver and/or fwmark for specific hostnames, pass `--rule-table PATH` with a JSON rule file (see `examples/rule_table.json`).
+To override the resolver, direct target, and/or fwmark for specific hostnames, pass `--rule-table PATH` with a JSON rule file (see `examples/rule_table.json`).
+
+To forward the original client/target metadata to upstream servers, add `--enable-proxy-protocol` to prepend a PROXY protocol v1 header to every outbound connection.
 
 ## Rule table format
 
@@ -25,7 +27,7 @@ The table maps hostname patterns to overrides:
 
 ```json
 {
-  "www.example.com": { "resolver": "https://8.8.8.8/resolve", "fwmark": 1 },
+  "www.example.com": { "direct": "10.0.1.2:8443", "fwmark": 1 },
   "*.apple.com": { "resolver": "https://1.1.1.1/dns-query" },
   "*": { "fwmark": 3 }
 }
@@ -33,7 +35,9 @@ The table maps hostname patterns to overrides:
 
 - Exact hostnames are matched case-insensitively first.
 - Wildcards must either be `*` (catch-all) or start with `*.` to match any subdomain of the suffix (e.g. `*.example.com`).
-- Each rule must set at least one of `resolver` or `fwmark`.
+- Each rule must set at least one of `resolver`, `direct`, or `fwmark`.
+- `direct` takes a `host:port` pair (e.g. `10.0.1.2:8443`) and skips DNS resolution entirely.
+- `direct` and `resolver` are mutually exclusive for a given rule.
 - Missing fields fall back to the global `--resolver` / `--fwmark` configuration.
 
 ## Hot reloading

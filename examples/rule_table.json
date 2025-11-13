@@ -1,6 +1,6 @@
 {
     "www.example.com": {
-        "resolver": "https://8.8.8.8",
+        "direct": "10.0.1.2:8443",
         "fwmark": 1
     },
     "*.apple.com": {

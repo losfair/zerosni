@@ -59,6 +59,9 @@ struct Cli {
   /// DNS-over-HTTPS resolver endpoint (must be HTTPS).
   #[arg(long)]
   resolver: String,
+  /// Send a PROXY protocol v1 header to upstream servers.
+  #[arg(long = "enable-proxy-protocol")]
+  enable_proxy_protocol: bool,
   /// Firewall mark to apply to outbound sockets (Linux only).
   #[arg(long)]
   fwmark: Option<u32>,
@@ -72,10 +75,16 @@ struct ProxyContext {
   default_resolver: String,
   default_fwmark: Option<u32>,
   rule_table: Arc<ArcSwapOption<RuleTable>>,
+  enable_proxy_protocol: bool,
+}
+
+enum RouteTarget {
+  Resolve(String),
+  Direct(SocketAddr),
 }
 
 struct RouteSelection {
-  resolver_url: String,
+  target: RouteTarget,
   fwmark: Option<u32>,
 }
 
@@ -86,18 +95,24 @@ impl ProxyContext {
       .load_full()
       .as_ref()
       .and_then(|table| table.lookup(hostname));
-    let resolver_url = overrides
-      .as_ref()
-      .and_then(|rule| rule.resolver.clone())
-      .unwrap_or_else(|| self.default_resolver.clone());
     let fwmark = overrides
       .as_ref()
       .and_then(|rule| rule.fwmark)
       .or(self.default_fwmark);
-    RouteSelection {
-      resolver_url,
-      fwmark,
-    }
+    let target = match overrides {
+      Some(rule) => {
+        if let Some(addr) = rule.direct {
+          RouteTarget::Direct(addr)
+        } else {
+          let resolver_url = rule
+            .resolver
+            .unwrap_or_else(|| self.default_resolver.clone());
+          RouteTarget::Resolve(resolver_url)
+        }
+      }
+      None => RouteTarget::Resolve(self.default_resolver.clone()),
+    };
+    RouteSelection { target, fwmark }
   }
 }
 
@@ -183,6 +198,7 @@ async fn amain() -> Result<()> {
     default_resolver,
     default_fwmark: fwmark,
     rule_table: rule_table.clone(),
+    enable_proxy_protocol: args.enable_proxy_protocol,
   });
 
   if let Some(path) = rule_table_path {
@@ -254,22 +270,23 @@ async fn handle_client(
   let socket = ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(client.as_raw_fd()) });
   let upstream = if let Some(hostname) = &hello.hostname {
     eprintln!("{peer_log_label} requested {}", hostname);
-    let RouteSelection {
-      resolver_url,
-      fwmark,
-    } = ctx.select_route(hostname);
+    let RouteSelection { target, fwmark } = ctx.select_route(hostname);
+    match target {
+      RouteTarget::Direct(addr) => connect_with_mark(addr, fwmark).await?,
+      RouteTarget::Resolve(resolver_url) => {
+        let candidates = ctx
+          .doh
+          .resolve(&resolver_url, hostname, fwmark)
+          .await
+          .with_context(|| format!("resolver lookup for {}", hostname))?;
 
-    let candidates = ctx
-      .doh
-      .resolve(&resolver_url, hostname, fwmark)
-      .await
-      .with_context(|| format!("resolver lookup for {}", hostname))?;
+        if candidates.is_empty() {
+          bail!("no DNS answers for {}", hostname);
+        }
 
-    if candidates.is_empty() {
-      bail!("no DNS answers for {}", hostname);
+        connect_to_any(&candidates, fwmark).await?
+      }
     }
-
-    connect_to_any(&candidates, fwmark).await?
   } else {
     let original_dst = socket
       .original_dst()?
@@ -280,7 +297,13 @@ async fn handle_client(
     connect_to_any(&[original_dst], ctx.default_fwmark).await?
   };
 
-  relay_streams(client, upstream, hello.buffer).await?;
+  let proxy_header = if ctx.enable_proxy_protocol {
+    Some(build_proxy_header(peer, upstream.peer_addr()?))
+  } else {
+    None
+  };
+
+  relay_streams(client, upstream, hello.buffer, proxy_header).await?;
   Ok(())
 }
 
@@ -352,11 +375,20 @@ fn extract_sni(record: &TlsPlaintext) -> Option<String> {
   None
 }
 
-async fn relay_streams(client: TcpStream, upstream: TcpStream, initial: Vec<u8>) -> Result<()> {
+async fn relay_streams(
+  client: TcpStream,
+  upstream: TcpStream,
+  initial: Vec<u8>,
+  proxy_header: Option<Vec<u8>>,
+) -> Result<()> {
   let (mut client_reader, mut client_writer) = client.into_split();
   let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
 
   let upload = async {
+    if let Some(header) = proxy_header {
+      let (res, _buf) = upstream_writer.write_all(header).await;
+      res?;
+    }
     if !initial.is_empty() {
       let (res, _buf) = upstream_writer.write_all(initial).await;
       res?;
@@ -376,6 +408,66 @@ async fn relay_streams(client: TcpStream, upstream: TcpStream, initial: Vec<u8>)
     }
   }
   Ok(())
+}
+
+fn build_proxy_header(mut src: SocketAddr, mut dst: SocketAddr) -> Vec<u8> {
+  for x in [&mut src, &mut dst] {
+    x.set_ip(x.ip().to_canonical());
+  }
+
+  let v6 = |x: IpAddr| match x {
+    IpAddr::V4(x) => x.to_ipv6_mapped(),
+    IpAddr::V6(x) => x,
+  };
+
+  match (src, dst) {
+    (SocketAddr::V4(s), SocketAddr::V4(d)) => format!(
+      "PROXY TCP4 {} {} {} {}\r\n",
+      s.ip(),
+      d.ip(),
+      s.port(),
+      d.port()
+    )
+    .into_bytes(),
+    (s, d) => format!(
+      "PROXY TCP6 {} {} {} {}\r\n",
+      v6(s.ip()),
+      v6(d.ip()),
+      s.port(),
+      d.port()
+    )
+    .into_bytes(),
+  }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+  use super::build_proxy_header;
+  use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+  #[test]
+  fn builds_ipv4_proxy_header() {
+    let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1234));
+    let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 443));
+    let header = build_proxy_header(src, dst);
+    assert_eq!(header, b"PROXY TCP4 10.0.0.1 203.0.113.10 1234 443\r\n");
+  }
+
+  #[test]
+  fn builds_ipv6_proxy_header() {
+    let src = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5555, 0, 0));
+    let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8443, 0, 0));
+    let header = build_proxy_header(src, dst);
+    assert_eq!(header, b"PROXY TCP6 ::1 ::1 5555 8443\r\n");
+  }
+
+  #[test]
+  fn falls_back_to_unknown_on_mixed_families() {
+    let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+    let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 2, 0, 0));
+    let header = build_proxy_header(src, dst);
+    assert_eq!(header, b"PROXY UNKNOWN\r\n");
+  }
 }
 
 impl DohClient {
