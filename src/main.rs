@@ -288,11 +288,16 @@ async fn handle_client(
       }
     }
   } else {
+    let local_addr = client.local_addr()?;
     let original_dst = socket
       .original_dst()?
       .as_socket()
       .with_context(|| "failed to get original_dst ip")?
       .ip();
+    if original_dst.to_canonical() == local_addr.ip().to_canonical() {
+      eprintln!("{peer_log_label} not bypassing {}", original_dst);
+      return Ok(());
+    }
     eprintln!("{peer_log_label} bypass {}", original_dst);
     connect_to_any(&[original_dst], ctx.default_fwmark).await?
   };
@@ -398,14 +403,15 @@ async fn relay_streams(
 
   let download = async { copy(&mut upstream_reader, &mut client_writer).await };
 
-  let (up_res, down_res) = monoio::join!(upload, download);
-  for outcome in [up_res, down_res] {
-    match outcome {
-      Ok(_) => {}
-      Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {}
-      Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
-      Err(err) => return Err(err.into()),
-    }
+  let res = monoio::select! {
+    x = upload => x,
+    x = download => x,
+  };
+  match res {
+    Ok(_) => {}
+    Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {}
+    Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+    Err(err) => return Err(err.into()),
   }
   Ok(())
 }
