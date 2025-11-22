@@ -26,7 +26,7 @@ use monoio::{
   IoUringDriver,
   io::{AsyncReadRentExt, AsyncWriteRentExt, Splitable, copy},
   net::udp::UdpSocket,
-  net::{TcpListener, TcpStream},
+  net::{ListenerOpts, TcpListener, TcpStream},
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tls_parser::{
@@ -171,7 +171,7 @@ async fn amain() -> Result<()> {
   if let Some(path) = rule_table_path {
     install_rule_table_reloader(rule_table, path);
   }
-  let listener = TcpListener::bind(args.listen)?;
+  let listener = TcpListener::bind_with_config(args.listen, &ListenerOpts::new().reuse_port(true))?;
 
   loop {
     let accepted = listener.accept().await;
