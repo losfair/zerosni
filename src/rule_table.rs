@@ -134,9 +134,9 @@ mod tests {
 
   #[test]
   fn resolver_override_respects_case_insensitive_match() {
-    let table = table(r#"{ "EXAMPLE.COM": { "resolver": "https://9.9.9.9" } }"#);
+    let table = table(r#"{ "EXAMPLE.COM": { "resolver": "udp://9.9.9.9" } }"#);
     let rule = table.lookup("Example.com").expect("match");
-    assert_eq!(rule.resolver.as_deref(), Some("https://9.9.9.9"));
+    assert_eq!(rule.resolver.as_deref(), Some("udp://9.9.9.9"));
     assert_eq!(rule.direct, None);
     assert_eq!(rule.fwmark, None);
   }
@@ -169,7 +169,7 @@ mod tests {
   #[test]
   fn rejects_direct_and_resolver() {
     let err = parse_table(
-      r#"{ "www.example.com": { "direct": "10.0.0.1:8443", "resolver": "https://1.1.1.1" } }"#,
+      r#"{ "www.example.com": { "direct": "10.0.0.1:8443", "resolver": "udp://1.1.1.1" } }"#,
     )
     .unwrap_err();
     assert!(

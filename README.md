@@ -1,20 +1,20 @@
 # zerosni
 
-`io_uring`-based SNI-inspecting TCP transparent proxy. It decodes outgoing TCP streams on port 443, resolves the SNI hostname through the provided DNS-over-HTTPS resolver, and proxies the stream to the resolved host.
+`io_uring`-based SNI-inspecting TCP transparent proxy. It decodes outgoing TCP streams on port 443, resolves the SNI hostname through the provided UDP resolver, and proxies the stream to the resolved host.
 
 ## Dependencies
 
 - `monoio`: the `io_uring` runtime
 - [tls-parser](https://crates.io/crates/tls-parser): TLS protocol decoder
+- `dns-parser`: DNS query builder/parser for UDP lookups
 - `clap`: Argument parser (use derive macro)
-- `monoio-http` and `monoio-rustls`: HTTP + TLS client to use for DNS-over-HTTPS queries
 
 ## Usage
 
 Start `zerosni`:
 
 ```bash
-zerosni --fwmark 1 --listen 0.0.0.0:1510 --resolver https://1.1.1.1/dns-query
+zerosni --fwmark 1 --listen 0.0.0.0:1510 --resolver 1.1.1.1:53
 ```
 
 To override the resolver, direct target, and/or fwmark for specific hostnames, pass `--rule-table PATH` with a JSON rule file (see `examples/rule_table.json`).
@@ -28,7 +28,7 @@ The table maps hostname patterns to overrides:
 ```json
 {
   "www.example.com": { "direct": "10.0.1.2:8443", "fwmark": 1 },
-  "*.apple.com": { "resolver": "https://1.1.1.1/dns-query" },
+  "*.apple.com": { "resolver": "udp://1.1.1.1" },
   "*": { "fwmark": 3 }
 }
 ```
@@ -37,6 +37,7 @@ The table maps hostname patterns to overrides:
 - Wildcards must either be `*` (catch-all) or start with `*.` to match any subdomain of the suffix (e.g. `*.example.com`).
 - Each rule must set at least one of `resolver`, `direct`, or `fwmark`.
 - `direct` takes a `host:port` pair (e.g. `10.0.1.2:8443`) and skips DNS resolution entirely.
+- `resolver` accepts a UDP resolver address as `host[:port]` or `udp://host[:port]` (default port 53).
 - `direct` and `resolver` are mutually exclusive for a given rule.
 - Missing fields fall back to the global `--resolver` / `--fwmark` configuration.
 

@@ -2,7 +2,7 @@ mod rule_table;
 mod util;
 
 use arc_swap::ArcSwapOption;
-use bytes::Bytes;
+use dns_parser::{Builder, Packet, QueryClass, QueryType, RData, ResponseCode};
 use rule_table::RuleTable;
 use std::{
   collections::{HashMap, HashSet},
@@ -12,43 +12,39 @@ use std::{
   os::fd::{AsRawFd, FromRawFd, RawFd},
   path::PathBuf,
   str,
-  sync::{Arc, Mutex, OnceLock},
+  sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU16, Ordering},
+  },
   time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use http::{Method, StatusCode, Version, header};
 use moka::future::Cache;
 use monoio::{
   IoUringDriver,
-  io::{AsyncReadRentExt, AsyncWriteRentExt, Splitable, copy, sink::Sink, stream::Stream},
+  io::{AsyncReadRentExt, AsyncWriteRentExt, Splitable, copy},
+  net::udp::UdpSocket,
   net::{TcpListener, TcpStream},
 };
-use monoio_http::{
-  common::{body::Body, error::HttpError, request::Request},
-  h1::{codec::ClientCodec, payload::Payload},
-};
-use monoio_rustls::{ClientTlsStream, TlsConnector};
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
-use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use tls_parser::{
   SNIType, TlsExtension, TlsMessage, TlsMessageHandshake, TlsPlaintext,
   parse_tls_client_hello_extensions, parse_tls_plaintext,
 };
-use url::{Url, form_urlencoded};
-use webpki_roots::TLS_SERVER_ROOTS;
+use url::Url;
 
 use crate::util::read_to_end;
 
-const DEFAULT_DOH_PATH: &str = "/dns-query";
 const MAX_CLIENT_HELLO_SIZE: usize = 64 * 1024;
 const TARGET_PORT: u16 = 443;
-const USER_AGENT: &str = concat!("zerosni/", env!("CARGO_PKG_VERSION"));
 const DNS_CACHE_TTL_SECS: u64 = 180;
 const DNS_CACHE_CAPACITY: u64 = 16384;
+const DNS_DEFAULT_PORT: u16 = 53;
+const MAX_DNS_MESSAGE_SIZE: usize = 4096;
+
+static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(0);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -56,7 +52,7 @@ struct Cli {
   /// Address to accept redirected TLS connections from.
   #[arg(long)]
   listen: SocketAddr,
-  /// DNS-over-HTTPS resolver endpoint (must be HTTPS).
+  /// UDP resolver to query for hostnames (host[:port], defaults to 53).
   #[arg(long)]
   resolver: String,
   /// Send a PROXY protocol v1 header to upstream servers.
@@ -71,7 +67,7 @@ struct Cli {
 }
 
 struct ProxyContext {
-  doh: Arc<DohClient>,
+  dns: Arc<DnsClient>,
   default_resolver: String,
   default_fwmark: Option<u32>,
   rule_table: Arc<ArcSwapOption<RuleTable>>,
@@ -116,20 +112,14 @@ impl ProxyContext {
   }
 }
 
-struct DohClient {
-  connector: TlsConnector,
+struct DnsClient {
   cache: &'static Cache<String, Vec<IpAddr>>,
   resolvers: Mutex<HashMap<String, Arc<ResolverConfig>>>,
 }
 
 #[derive(Debug, Clone)]
 struct ResolverConfig {
-  server_name: ServerName<'static>,
-  host: String,
-  port: u16,
-  authority: String,
-  path: String,
-  base_query: Vec<(String, String)>,
+  addrs: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Copy)]
@@ -138,37 +128,14 @@ enum RecordType {
   Aaaa,
 }
 
-#[derive(Deserialize)]
-struct DohResponse {
-  #[serde(rename = "Status")]
-  status: u32,
-  #[serde(rename = "Answer")]
-  answers: Option<Vec<DohAnswer>>,
-}
-
-#[derive(Deserialize)]
-struct DohAnswer {
-  #[serde(rename = "type")]
-  record_type: u16,
-  #[serde(rename = "data")]
-  data: String,
-}
-
 struct ClientHelloCapture {
   hostname: Option<String>,
   buffer: Vec<u8>,
 }
 
-fn install_crypto_provider() -> Result<()> {
-  static INSTALLED: OnceLock<()> = OnceLock::new();
-  INSTALLED.get_or_init(|| {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-  });
-  Ok(())
-}
-
 fn main() -> Result<()> {
   monoio::RuntimeBuilder::<IoUringDriver>::new()
+    .enable_timer()
     .build()
     .expect("zerosni: failed to build io_uring runtime")
     .block_on(amain())
@@ -179,7 +146,7 @@ async fn amain() -> Result<()> {
 
   let default_resolver = args.resolver.clone();
   let fwmark = args.fwmark.filter(|mark| *mark != 0);
-  let doh = Arc::new(DohClient::new()?);
+  let dns = Arc::new(DnsClient::new()?);
   let rule_table_path = args.rule_table.clone();
   let initial_rule_table = if let Some(path) = rule_table_path.as_ref() {
     Some(Arc::new(RuleTable::from_file(path)?))
@@ -194,7 +161,7 @@ async fn amain() -> Result<()> {
   );
 
   let ctx = Arc::new(ProxyContext {
-    doh,
+    dns,
     default_resolver,
     default_fwmark: fwmark,
     rule_table: rule_table.clone(),
@@ -275,7 +242,7 @@ async fn handle_client(
       RouteTarget::Direct(addr) => connect_with_mark(addr, fwmark).await?,
       RouteTarget::Resolve(resolver_url) => {
         let candidates = ctx
-          .doh
+          .dns
           .resolve(&resolver_url, hostname, fwmark)
           .await
           .with_context(|| format!("resolver lookup for {}", hostname))?;
@@ -476,15 +443,8 @@ mod proxy_tests {
   }
 }
 
-impl DohClient {
+impl DnsClient {
   fn new() -> Result<Self> {
-    install_crypto_provider()?;
-
-    let root_store = RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-      .with_root_certificates(root_store)
-      .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
     let cache = &*Box::leak(Box::new(
       Cache::builder()
         .time_to_live(Duration::from_secs(DNS_CACHE_TTL_SECS))
@@ -512,7 +472,6 @@ impl DohClient {
       .expect("failed to spawn zerosni-gc");
 
     Ok(Self {
-      connector,
       cache,
       resolvers: Mutex::new(HashMap::new()),
     })
@@ -536,7 +495,7 @@ impl DohClient {
       Ok(addrs) => Ok(addrs),
       Err(err) => match Arc::try_unwrap(err) {
         Ok(inner) => Err(inner),
-        Err(shared) => Err(anyhow!(shared.as_ref().to_string())),
+        Err(shared) => Err(anyhow!("{:?}", shared.as_ref())),
       },
     }
   }
@@ -576,147 +535,158 @@ impl DohClient {
     ty: RecordType,
     fwmark: Option<u32>,
   ) -> Result<Vec<IpAddr>> {
-    let path = Self::build_request_path(resolver, hostname, ty);
-    let tls = self.open_tls_stream(resolver, fwmark).await?;
-    let mut codec = ClientCodec::new(tls);
-    let request = Request::builder()
-      .method(Method::GET)
-      .version(Version::HTTP_11)
-      .uri(path)
-      .header(header::HOST, resolver.authority.as_str())
-      .header(header::USER_AGENT, USER_AGENT)
-      .header(header::ACCEPT, "application/dns-json")
-      .header(header::CONNECTION, "close")
-      .body(Payload::<Bytes, HttpError>::None)
-      .expect("static request build cannot fail");
-    codec.send(request).await?;
-    <ClientCodec<ClientTlsStream<TcpStream>> as Sink<
-            http::Request<Payload<Bytes, HttpError>>,
-        >>::flush(&mut codec)
-        .await?;
-    let response = codec
-      .next()
-      .await
-      .ok_or_else(|| anyhow!("resolver closed the connection"))??;
-    if response.status() != StatusCode::OK {
-      bail!("resolver returned {}", response.status());
-    }
-    let (_, body) = response.into_parts();
-    let mut payload = body.with_io(&mut codec);
-    let mut body_bytes = Vec::new();
-    while let Some(chunk) = payload.next_data().await {
-      let bytes = chunk?;
-      body_bytes.extend_from_slice(bytes.as_ref());
-    }
-    let parsed: DohResponse =
-      serde_json::from_slice(&body_bytes).context("failed to parse resolver response")?;
-    if parsed.status != 0 {
-      bail!("resolver returned DNS error status {}", parsed.status);
-    }
-    let mut addrs = Vec::new();
-    if let Some(records) = parsed.answers {
-      for record in records {
-        if record.record_type == ty.code() {
-          if let Ok(ip) = record.data.parse::<IpAddr>() {
-            addrs.push(ip);
-          }
-        }
-      }
-    }
-    Ok(addrs)
+    let (query, query_id) = build_dns_query(hostname, ty)?;
+    let response = Self::send_query(&resolver.addrs, query, fwmark).await?;
+    Self::parse_response(&response, ty, query_id)
   }
 
-  fn build_request_path(resolver: &ResolverConfig, hostname: &str, ty: RecordType) -> String {
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    for (k, v) in &resolver.base_query {
-      serializer.append_pair(k, v);
-    }
-    serializer.append_pair("name", hostname);
-    serializer.append_pair("type", ty.label());
-    let query = serializer.finish();
-    if query.is_empty() {
-      resolver.path.clone()
-    } else {
-      format!("{}?{}", resolver.path, query)
-    }
-  }
-
-  async fn open_tls_stream(
-    &self,
-    resolver: &ResolverConfig,
+  async fn send_query(
+    addrs: &[SocketAddr],
+    payload: Vec<u8>,
     fwmark: Option<u32>,
-  ) -> Result<ClientTlsStream<TcpStream>> {
+  ) -> Result<Vec<u8>> {
+    if addrs.is_empty() {
+      bail!("resolver host does not resolve to any addresses");
+    }
     let mut last_err = None;
-    for addr in resolve_host(&resolver.host, resolver.port)? {
-      match connect_with_mark(addr, fwmark).await {
-        Ok(stream) => {
-          return self
-            .connector
-            .connect(resolver.server_name.clone(), stream)
-            .await
-            .map_err(Into::into);
-        }
+    let mut query = payload;
+    for (idx, addr) in addrs.iter().copied().enumerate() {
+      let buf = if idx + 1 == addrs.len() {
+        std::mem::take(&mut query)
+      } else {
+        query.clone()
+      };
+      match Self::send_single_query(addr, buf, fwmark).await {
+        Ok(resp) => return Ok(resp),
         Err(err) => last_err = Some(err),
       }
     }
-    let err = last_err
-      .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "unable to resolve resolver host"));
-    Err(err.into())
+    Err(last_err.unwrap_or_else(|| anyhow!("unknown DNS resolver error")))
+  }
+
+  async fn send_single_query(
+    addr: SocketAddr,
+    payload: Vec<u8>,
+    fwmark: Option<u32>,
+  ) -> Result<Vec<u8>> {
+    let domain = match addr {
+      SocketAddr::V4(_) => Domain::IPV4,
+      SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_nonblocking(true)?;
+    if let Some(mark) = fwmark {
+      socket.set_mark(mark)?;
+    }
+    let std_socket: std::net::UdpSocket = socket.into();
+    std_socket.set_nonblocking(true)?;
+    let udp = UdpSocket::from_std(std_socket)?;
+    let (write_res, _) = udp.send_to(payload, addr).await;
+    write_res?;
+    let (read_res, buf) = monoio::time::timeout(
+      Duration::from_secs(5),
+      udp.recv_from(vec![0u8; MAX_DNS_MESSAGE_SIZE]),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("query timeout"))?;
+    let (len, src) = read_res?;
+    if src.ip().to_canonical() != addr.ip().to_canonical() || src.port() != addr.port() {
+      bail!("received DNS response from unexpected address {src}");
+    }
+    Ok(buf[..len.min(buf.len())].to_vec())
+  }
+
+  fn parse_response(bytes: &[u8], ty: RecordType, query_id: u16) -> Result<Vec<IpAddr>> {
+    let packet = Packet::parse(bytes).context("failed to parse DNS response")?;
+    if packet.header.id != query_id {
+      bail!("DNS response transaction ID mismatch");
+    }
+    if packet.header.response_code != ResponseCode::NoError {
+      bail!(
+        "resolver returned DNS error {:?}",
+        packet.header.response_code
+      );
+    }
+    let mut addrs = Vec::new();
+    for answer in packet.answers {
+      match (ty, answer.data) {
+        (RecordType::A, RData::A(record)) => addrs.push(IpAddr::V4(record.0)),
+        (RecordType::Aaaa, RData::AAAA(record)) => addrs.push(IpAddr::V6(record.0)),
+        _ => {}
+      }
+    }
+    Ok(addrs)
   }
 }
 
 impl ResolverConfig {
   fn parse(uri: &str) -> Result<Self> {
-    let mut url = Url::parse(uri).context("invalid resolver URL")?;
-    if url.scheme() != "https" {
-      bail!("resolver URL must use https://");
-    }
-    if url.path().is_empty() || url.path() == "/" {
-      url.set_path(DEFAULT_DOH_PATH);
+    let formatted = if uri.contains("://") {
+      uri.to_string()
+    } else {
+      format!("udp://{uri}")
+    };
+    let url = Url::parse(&formatted).or_else(|_| {
+      if uri.contains("://") || uri.contains('[') || !uri.contains(':') {
+        return Err(anyhow!("invalid resolver address"));
+      }
+      let bracketed = format!("udp://[{uri}]");
+      Url::parse(&bracketed).map_err(|_| anyhow!("invalid resolver address"))
+    })?;
+    if url.scheme() != "udp" {
+      bail!("resolver must use udp://");
     }
     let host = url
       .host_str()
-      .ok_or_else(|| anyhow!("resolver URL missing host"))?
-      .to_string();
-    let port = url
-      .port_or_known_default()
-      .ok_or_else(|| anyhow!("resolver URL missing port"))?;
-    let authority = if port == 443 {
-      host.clone()
-    } else {
-      format!("{host}:{port}")
-    };
-    let server_name = ServerName::try_from(host.clone())
-      .map_err(|_| anyhow!("resolver host is not a valid TLS name"))?;
-    let base_query = url
-      .query_pairs()
-      .map(|(k, v)| (k.into_owned(), v.into_owned()))
-      .collect();
-    Ok(Self {
-      server_name,
-      host,
-      port,
-      authority,
-      path: url.path().to_string(),
-      base_query,
-    })
+      .ok_or_else(|| anyhow!("resolver missing host"))?;
+    let port = url.port().unwrap_or(DNS_DEFAULT_PORT);
+    let mut addrs = resolve_host(host, port)
+      .with_context(|| format!("failed to resolve resolver host {host}"))?;
+    addrs.retain(|addr| addr.port() == port);
+    if addrs.is_empty() {
+      bail!("resolver host {host} did not resolve to any addresses");
+    }
+    Ok(Self { addrs })
   }
 }
 
 impl RecordType {
-  fn label(self) -> &'static str {
+  fn query_type(self) -> QueryType {
     match self {
-      RecordType::A => "A",
-      RecordType::Aaaa => "AAAA",
+      RecordType::A => QueryType::A,
+      RecordType::Aaaa => QueryType::AAAA,
     }
   }
+}
 
-  fn code(self) -> u16 {
-    match self {
-      RecordType::A => 1,
-      RecordType::Aaaa => 28,
+fn build_dns_query(hostname: &str, ty: RecordType) -> Result<(Vec<u8>, u16)> {
+  validate_dns_hostname(hostname)?;
+  let query_id = next_query_id();
+  let mut builder = Builder::new_query(query_id, true);
+  builder.add_question(hostname, false, ty.query_type(), QueryClass::IN);
+  let packet = match builder.build() {
+    Ok(buf) | Err(buf) => buf,
+  };
+  Ok((packet, query_id))
+}
+
+fn validate_dns_hostname(hostname: &str) -> Result<()> {
+  if hostname.is_empty() || hostname.len() > 255 {
+    bail!("hostname is not a valid DNS name");
+  }
+  for label in hostname.split('.') {
+    if label.is_empty() {
+      bail!("hostname contains an empty DNS label");
+    }
+    if label.len() > 63 {
+      bail!("hostname label exceeds 63 characters");
     }
   }
+  Ok(())
+}
+
+fn next_query_id() -> u16 {
+  DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 async fn connect_to_any(candidates: &[IpAddr], fwmark: Option<u32>) -> Result<TcpStream> {
