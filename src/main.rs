@@ -1,3 +1,4 @@
+mod async_print;
 mod rule_table;
 mod util;
 
@@ -8,7 +9,7 @@ use std::{
   collections::{HashMap, HashSet},
   io,
   mem::ManuallyDrop,
-  net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+  net::{IpAddr, Ipv4Addr, SocketAddr},
   os::fd::{AsRawFd, FromRawFd, RawFd},
   path::PathBuf,
   str,
@@ -119,7 +120,7 @@ struct DnsClient {
 
 #[derive(Debug, Clone)]
 struct ResolverConfig {
-  addrs: Vec<SocketAddr>,
+  addr: SocketAddr,
 }
 
 #[derive(Clone, Copy)]
@@ -536,7 +537,7 @@ impl DnsClient {
     fwmark: Option<u32>,
   ) -> Result<Vec<IpAddr>> {
     let (query, query_id) = build_dns_query(hostname, ty)?;
-    let response = Self::send_query(&resolver.addrs, query, fwmark).await?;
+    let response = Self::send_query(&[resolver.addr], query, fwmark).await?;
     Self::parse_response(&response, ty, query_id)
   }
 
@@ -640,13 +641,13 @@ impl ResolverConfig {
       .host_str()
       .ok_or_else(|| anyhow!("resolver missing host"))?;
     let port = url.port().unwrap_or(DNS_DEFAULT_PORT);
-    let mut addrs = resolve_host(host, port)
-      .with_context(|| format!("failed to resolve resolver host {host}"))?;
-    addrs.retain(|addr| addr.port() == port);
-    if addrs.is_empty() {
-      bail!("resolver host {host} did not resolve to any addresses");
-    }
-    Ok(Self { addrs })
+    let addr = SocketAddr::new(
+      host
+        .parse()
+        .with_context(|| "host is not a valid ip address")?,
+      port,
+    );
+    Ok(Self { addr })
   }
 }
 
@@ -751,15 +752,6 @@ fn check_connect_error(fd: RawFd) -> io::Result<()> {
   } else {
     Err(io::Error::from_raw_os_error(error))
   }
-}
-
-fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-  let target = if host.contains(':') {
-    format!("[{host}]:{port}")
-  } else {
-    format!("{host}:{port}")
-  };
-  target.to_socket_addrs().map(|iter| iter.collect())
 }
 
 fn format_peer_with_mac(peer: SocketAddr, mac: Option<&str>) -> String {
