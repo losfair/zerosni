@@ -156,9 +156,10 @@ async fn amain() -> Result<()> {
   };
   let rule_table = Arc::new(ArcSwapOption::from(initial_rule_table));
 
-  eprintln!(
+  aeprintln!(
     "zerosni listening on {} (resolver: {})",
-    args.listen, default_resolver
+    args.listen,
+    default_resolver
   );
 
   let ctx = Arc::new(ProxyContext {
@@ -179,17 +180,17 @@ async fn amain() -> Result<()> {
     match accepted {
       Ok((stream, peer)) => {
         if let Err(err) = stream.set_nodelay(true) {
-          eprintln!("failed to set nodelay on accepted stream: {err}");
+          aeprintln!("failed to set nodelay on accepted stream: {err}");
         }
         let ctx = ctx.clone();
         monoio::spawn(async move {
           if let Err(err) = handle_client(stream, peer, ctx).await {
-            eprintln!("connection from {peer} failed: {err:?}");
+            aeprintln!("connection from {peer} failed: {err:?}");
           }
         });
       }
       Err(err) => {
-        eprintln!("accept error: {err}");
+        aeprintln!("accept error: {err}");
       }
     }
   }
@@ -237,7 +238,7 @@ async fn handle_client(
   let hello = capture_client_hello(&mut client).await?;
   let socket = ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(client.as_raw_fd()) });
   let upstream = if let Some(hostname) = &hello.hostname {
-    eprintln!("{peer_log_label} requested {}", hostname);
+    aeprintln!("{peer_log_label} requested {}", hostname);
     let RouteSelection { target, fwmark } = ctx.select_route(hostname);
     match target {
       RouteTarget::Direct(addr) => connect_with_mark(addr, fwmark).await?,
@@ -263,10 +264,10 @@ async fn handle_client(
       .with_context(|| "failed to get original_dst ip")?
       .ip();
     if original_dst.to_canonical() == local_addr.ip().to_canonical() {
-      eprintln!("{peer_log_label} not bypassing {}", original_dst);
+      aeprintln!("{peer_log_label} not bypassing {}", original_dst);
       return Ok(());
     }
-    eprintln!("{peer_log_label} bypass {}", original_dst);
+    aeprintln!("{peer_log_label} bypass {}", original_dst);
     connect_to_any(&[original_dst], ctx.default_fwmark).await?
   };
 
@@ -293,7 +294,7 @@ async fn capture_client_hello(stream: &mut TcpStream) -> Result<ClientHelloCaptu
   }
   captured.extend_from_slice(&header);
   if header[0] != 0x16 {
-    eprintln!("{peer_addr}: connection does not begin with a TLS handshake");
+    aeprintln!("{peer_addr}: connection does not begin with a TLS handshake");
 
     return Ok(ClientHelloCapture {
       hostname: None,
@@ -316,7 +317,7 @@ async fn capture_client_hello(stream: &mut TcpStream) -> Result<ClientHelloCaptu
     parse_tls_plaintext(record).map_err(|_| anyhow!("unable to parse TLS record"))?;
   let hostname = extract_sni(&plaintext);
   if hostname.is_none() {
-    eprintln!("{peer_addr}: TLS ClientHello did not include an SNI extension",);
+    aeprintln!("{peer_addr}: TLS ClientHello did not include an SNI extension",);
   }
   Ok(ClientHelloCapture {
     hostname,

@@ -2,6 +2,13 @@ use std::{os::fd::AsFd, rc::Rc};
 
 use monoio::fs::File;
 
+#[macro_export]
+macro_rules! aeprintln {
+  ($($arg:tt)*) => {
+    $crate::async_print::print_stderr(format!("{}\n", format_args!($($arg)*))).await
+  };
+}
+
 pub async fn print_stderr(msg: String) {
   thread_local! {
     static STDERR: Rc<File> = Rc::new(File::from_std(
