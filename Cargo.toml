@@ -8,6 +8,7 @@ panic = "abort"
 
 [dependencies]
 arc-swap = "1"
+compact_str = { version = "0.9", features = ["serde"] }
 dns-parser = "0.8"
 tls-parser = "0.12"
 monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "utils", "macros"] }

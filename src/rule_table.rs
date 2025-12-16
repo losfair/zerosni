@@ -1,20 +1,22 @@
 use std::{collections::HashMap, io::Read, net::SocketAddr, path::Path};
 
 use anyhow::{Context, Result, bail};
+use compact_str::CompactString;
 use serde::Deserialize;
 use struson::reader::{JsonReader, JsonStreamReader};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RuleOverride {
-  pub resolver: Option<String>,
+  pub resolver: Option<CompactString>,
   pub direct: Option<SocketAddr>,
-  pub fwmark: Option<u32>,
+  #[serde(default)]
+  pub fwmark: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct RuleTable {
-  exact: HashMap<String, RuleOverride>,
-  wildcard: HashMap<String, RuleOverride>,
+  exact: HashMap<CompactString, RuleOverride>,
+  wildcard: HashMap<CompactString, RuleOverride>,
 }
 
 impl RuleTable {
@@ -26,7 +28,7 @@ impl RuleTable {
 
   pub fn lookup(&self, hostname: &str) -> Option<RuleOverride> {
     let query = hostname.to_ascii_lowercase();
-    if let Some(rule) = self.exact.get(&query) {
+    if let Some(rule) = self.exact.get(query.as_str()) {
       return Some(rule.clone());
     }
     let mut remainder = query.as_str();
@@ -85,22 +87,19 @@ fn validate_overrides(overrides: &RuleOverride, pattern: &str) -> Result<()> {
   if overrides.direct.is_some() && overrides.resolver.is_some() {
     bail!("rule '{pattern}' cannot set both 'direct' and 'resolver'");
   }
-  if overrides.direct.is_none() && overrides.resolver.is_none() && overrides.fwmark.is_none() {
-    bail!("rule '{pattern}' must specify at least one override");
-  }
   Ok(())
 }
 
 fn insert_unique(
-  map: &mut HashMap<String, RuleOverride>,
+  map: &mut HashMap<CompactString, RuleOverride>,
   key: String,
   overrides: RuleOverride,
   pattern: &str,
 ) -> Result<()> {
-  if map.contains_key(&key) {
+  if map.contains_key(key.as_str()) {
     bail!("duplicate rule for pattern '{pattern}'");
   }
-  map.insert(key, overrides);
+  map.insert(key.into(), overrides);
   Ok(())
 }
 
@@ -126,10 +125,10 @@ mod tests {
         "*": { "fwmark": 3 }
       }"#,
     );
-    assert_eq!(table.lookup("www.example.com").unwrap().fwmark, Some(1));
-    assert_eq!(table.lookup("api.example.com").unwrap().fwmark, Some(2));
-    assert_eq!(table.lookup("notexample.com").unwrap().fwmark, Some(3));
-    assert_eq!(table.lookup("other.test").unwrap().fwmark, Some(3));
+    assert_eq!(table.lookup("www.example.com").unwrap().fwmark, 1);
+    assert_eq!(table.lookup("api.example.com").unwrap().fwmark, 2);
+    assert_eq!(table.lookup("notexample.com").unwrap().fwmark, 3);
+    assert_eq!(table.lookup("other.test").unwrap().fwmark, 3);
   }
 
   #[test]
@@ -138,7 +137,7 @@ mod tests {
     let rule = table.lookup("Example.com").expect("match");
     assert_eq!(rule.resolver.as_deref(), Some("udp://9.9.9.9"));
     assert_eq!(rule.direct, None);
-    assert_eq!(rule.fwmark, None);
+    assert_eq!(rule.fwmark, 0);
   }
 
   #[test]
@@ -147,23 +146,13 @@ mod tests {
     let rule = table.lookup("www.example.com").expect("match");
     assert_eq!(rule.direct, Some("10.0.0.1:8443".parse().unwrap()));
     assert_eq!(rule.resolver, None);
-    assert_eq!(rule.fwmark, None);
+    assert_eq!(rule.fwmark, 0);
   }
 
   #[test]
   fn rejects_empty_table() {
     let err = parse_table("{}").unwrap_err();
     assert!(err.to_string().contains("must define at least one rule"));
-  }
-
-  #[test]
-  fn rejects_empty_override() {
-    let err = parse_table(r#"{ "*": { } }"#).unwrap_err();
-    assert!(
-      err
-        .to_string()
-        .contains("must specify at least one override")
-    );
   }
 
   #[test]
@@ -187,9 +176,9 @@ mod tests {
         "*": { "fwmark": 4 }
       }"#,
     );
-    assert_eq!(table.lookup("a.example.com").unwrap().fwmark, Some(9));
-    assert_eq!(table.lookup("b.c.example.com").unwrap().fwmark, Some(9));
-    assert_eq!(table.lookup("elsewhere.com").unwrap().fwmark, Some(4));
+    assert_eq!(table.lookup("a.example.com").unwrap().fwmark, 9);
+    assert_eq!(table.lookup("b.c.example.com").unwrap().fwmark, 9);
+    assert_eq!(table.lookup("elsewhere.com").unwrap().fwmark, 4);
   }
 
   #[test]

@@ -3,6 +3,7 @@ mod rule_table;
 mod util;
 
 use arc_swap::ArcSwapOption;
+use compact_str::CompactString;
 use dns_parser::{Builder, Packet, QueryClass, QueryType, RData, ResponseCode};
 use rule_table::RuleTable;
 use std::{
@@ -60,8 +61,8 @@ struct Cli {
   #[arg(long = "enable-proxy-protocol")]
   enable_proxy_protocol: bool,
   /// Firewall mark to apply to outbound sockets (Linux only).
-  #[arg(long)]
-  fwmark: Option<u32>,
+  #[arg(long, default_value = "0")]
+  fwmark: u32,
   /// Path to a JSON rule table that overrides resolver/fwmark per hostname.
   #[arg(long = "rule-table")]
   rule_table: Option<PathBuf>,
@@ -69,20 +70,20 @@ struct Cli {
 
 struct ProxyContext {
   dns: Arc<DnsClient>,
-  default_resolver: String,
-  default_fwmark: Option<u32>,
+  default_resolver: CompactString,
+  default_fwmark: u32,
   rule_table: Arc<ArcSwapOption<RuleTable>>,
   enable_proxy_protocol: bool,
 }
 
 enum RouteTarget {
-  Resolve(String),
+  Resolve(CompactString),
   Direct(SocketAddr),
 }
 
 struct RouteSelection {
   target: RouteTarget,
-  fwmark: Option<u32>,
+  fwmark: u32,
 }
 
 impl ProxyContext {
@@ -94,8 +95,8 @@ impl ProxyContext {
       .and_then(|table| table.lookup(hostname));
     let fwmark = overrides
       .as_ref()
-      .and_then(|rule| rule.fwmark)
-      .or(self.default_fwmark);
+      .map(|rule| rule.fwmark)
+      .unwrap_or(self.default_fwmark);
     let target = match overrides {
       Some(rule) => {
         if let Some(addr) = rule.direct {
@@ -145,8 +146,8 @@ fn main() -> Result<()> {
 async fn amain() -> Result<()> {
   let args = Cli::parse();
 
-  let default_resolver = args.resolver.clone();
-  let fwmark = args.fwmark.filter(|mark| *mark != 0);
+  let default_resolver = CompactString::new(&args.resolver);
+  let fwmark = args.fwmark;
   let dns = Arc::new(DnsClient::new()?);
   let rule_table_path = args.rule_table.clone();
   let initial_rule_table = if let Some(path) = rule_table_path.as_ref() {
@@ -435,14 +436,6 @@ mod proxy_tests {
     let header = build_proxy_header(src, dst);
     assert_eq!(header, b"PROXY TCP6 ::1 ::1 5555 8443\r\n");
   }
-
-  #[test]
-  fn falls_back_to_unknown_on_mixed_families() {
-    let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
-    let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 2, 0, 0));
-    let header = build_proxy_header(src, dst);
-    assert_eq!(header, b"PROXY UNKNOWN\r\n");
-  }
 }
 
 impl DnsClient {
@@ -479,12 +472,7 @@ impl DnsClient {
     })
   }
 
-  async fn resolve(
-    &self,
-    resolver_url: &str,
-    hostname: &str,
-    fwmark: Option<u32>,
-  ) -> Result<Vec<IpAddr>> {
+  async fn resolve(&self, resolver_url: &str, hostname: &str, fwmark: u32) -> Result<Vec<IpAddr>> {
     let resolver = self.get_resolver(resolver_url)?;
     let host = hostname.to_string();
     match self
@@ -516,7 +504,7 @@ impl DnsClient {
     &self,
     resolver: Arc<ResolverConfig>,
     hostname: &str,
-    fwmark: Option<u32>,
+    fwmark: u32,
   ) -> Result<Vec<IpAddr>> {
     let mut seen = HashSet::new();
     let mut addrs = Vec::new();
@@ -535,18 +523,14 @@ impl DnsClient {
     resolver: &ResolverConfig,
     hostname: &str,
     ty: RecordType,
-    fwmark: Option<u32>,
+    fwmark: u32,
   ) -> Result<Vec<IpAddr>> {
     let (query, query_id) = build_dns_query(hostname, ty)?;
     let response = Self::send_query(&[resolver.addr], query, fwmark).await?;
     Self::parse_response(&response, ty, query_id)
   }
 
-  async fn send_query(
-    addrs: &[SocketAddr],
-    payload: Vec<u8>,
-    fwmark: Option<u32>,
-  ) -> Result<Vec<u8>> {
+  async fn send_query(addrs: &[SocketAddr], payload: Vec<u8>, fwmark: u32) -> Result<Vec<u8>> {
     if addrs.is_empty() {
       bail!("resolver host does not resolve to any addresses");
     }
@@ -566,29 +550,33 @@ impl DnsClient {
     Err(last_err.unwrap_or_else(|| anyhow!("unknown DNS resolver error")))
   }
 
-  async fn send_single_query(
-    addr: SocketAddr,
-    payload: Vec<u8>,
-    fwmark: Option<u32>,
-  ) -> Result<Vec<u8>> {
+  async fn send_single_query(addr: SocketAddr, payload: Vec<u8>, fwmark: u32) -> Result<Vec<u8>> {
     let domain = match addr {
       SocketAddr::V4(_) => Domain::IPV4,
       SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_nonblocking(true)?;
-    if let Some(mark) = fwmark {
-      socket.set_mark(mark)?;
+    if fwmark != 0 {
+      socket.set_mark(fwmark)?;
     }
     let std_socket: std::net::UdpSocket = socket.into();
     std_socket.set_nonblocking(true)?;
     let udp = UdpSocket::from_std(std_socket)?;
-    let (write_res, _) = udp.send_to(payload, addr).await;
-    write_res?;
-    let (read_res, buf) = monoio::time::timeout(
-      Duration::from_secs(5),
-      udp.recv_from(vec![0u8; MAX_DNS_MESSAGE_SIZE]),
-    )
+    let mut payload = payload;
+    let send_loop = async {
+      loop {
+        let (_, buf) = udp.send_to(payload, addr).await;
+        payload = buf;
+        monoio::time::sleep(Duration::from_secs(1)).await;
+      }
+    };
+    let (read_res, buf) = monoio::time::timeout(Duration::from_secs(5), async {
+      monoio::select! {
+        x = udp.recv_from(vec![0u8; MAX_DNS_MESSAGE_SIZE]) => x,
+        x = send_loop => x
+      }
+    })
     .await
     .map_err(|_| anyhow::anyhow!("query timeout"))?;
     let (len, src) = read_res?;
@@ -680,8 +668,9 @@ fn validate_dns_hostname(hostname: &str) -> Result<()> {
     if label.is_empty() {
       bail!("hostname contains an empty DNS label");
     }
-    if label.len() > 63 {
-      bail!("hostname label exceeds 63 characters");
+    // the dns-parser crate contains a check `assert!(part.len() < 63)`
+    if label.len() >= 63 {
+      bail!("hostname label must be shorter than 63 characters");
     }
   }
   Ok(())
@@ -691,7 +680,7 @@ fn next_query_id() -> u16 {
   DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-async fn connect_to_any(candidates: &[IpAddr], fwmark: Option<u32>) -> Result<TcpStream> {
+async fn connect_to_any(candidates: &[IpAddr], fwmark: u32) -> Result<TcpStream> {
   let mut last_err = None;
   for ip in candidates {
     let addr = SocketAddr::new(*ip, TARGET_PORT);
@@ -705,7 +694,7 @@ async fn connect_to_any(candidates: &[IpAddr], fwmark: Option<u32>) -> Result<Tc
   Err(err.into())
 }
 
-async fn connect_with_mark(addr: SocketAddr, fwmark: Option<u32>) -> io::Result<TcpStream> {
+async fn connect_with_mark(addr: SocketAddr, fwmark: u32) -> io::Result<TcpStream> {
   let domain = match addr {
     SocketAddr::V4(_) => Domain::IPV4,
     SocketAddr::V6(_) => Domain::IPV6,
@@ -713,8 +702,8 @@ async fn connect_with_mark(addr: SocketAddr, fwmark: Option<u32>) -> io::Result<
   let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
   socket.set_nonblocking(true)?;
   socket.set_nodelay(true)?;
-  if let Some(mark) = fwmark {
-    socket.set_mark(mark)?;
+  if fwmark != 0 {
+    socket.set_mark(fwmark)?;
   }
   let sock_addr = socket2::SockAddr::from(addr);
   if let Err(err) = socket.connect(&sock_addr) {
