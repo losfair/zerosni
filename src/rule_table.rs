@@ -1,9 +1,61 @@
-use std::{collections::HashMap, io::Read, net::SocketAddr, path::Path};
+use std::{collections::HashMap, io::Read, net::SocketAddr, path::Path, str::FromStr};
 
 use anyhow::{Context, Result, bail};
 use compact_str::CompactString;
-use serde::Deserialize;
+use serde::{Deserialize, de};
 use struson::reader::{JsonReader, JsonStreamReader};
+
+/// Mirror address: either a fixed socket address or `_:<port>` to reflect to the client's IP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorAddr {
+  Fixed(SocketAddr),
+  ReflectToClient(u16),
+}
+
+impl MirrorAddr {
+  pub fn resolve(&self, client_addr: SocketAddr) -> SocketAddr {
+    match self {
+      MirrorAddr::Fixed(addr) => *addr,
+      MirrorAddr::ReflectToClient(port) => SocketAddr::new(client_addr.ip(), *port),
+    }
+  }
+}
+
+impl FromStr for MirrorAddr {
+  type Err = String;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    if let Some(port_str) = s.strip_prefix("_:") {
+      let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("invalid port in mirror address: {}", s))?;
+      Ok(MirrorAddr::ReflectToClient(port))
+    } else {
+      let addr: SocketAddr = s
+        .parse()
+        .map_err(|_| format!("invalid mirror address: {}", s))?;
+      Ok(MirrorAddr::Fixed(addr))
+    }
+  }
+}
+
+impl<'de> Deserialize<'de> for MirrorAddr {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: de::Deserializer<'de>,
+  {
+    let s = String::deserialize(deserializer)?;
+    s.parse().map_err(de::Error::custom)
+  }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TlsInterceptConfig {
+  pub mirror: MirrorAddr,
+  pub ca_cert: String,
+  pub ca_key: String,
+  pub match_fwmark: Option<u32>,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RuleOverride {
@@ -11,6 +63,7 @@ pub struct RuleOverride {
   pub direct: Option<SocketAddr>,
   #[serde(default)]
   pub fwmark: u32,
+  pub tls_intercept: Option<TlsInterceptConfig>,
 }
 
 #[derive(Debug, Clone)]

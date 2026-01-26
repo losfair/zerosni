@@ -1,5 +1,6 @@
 mod async_print;
 mod rule_table;
+mod tls_intercept;
 mod util;
 
 use arc_swap::ArcSwapOption;
@@ -20,6 +21,7 @@ use std::{
   },
   time::Duration,
 };
+use tls_intercept::TlsInterceptor;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -37,6 +39,7 @@ use tls_parser::{
 };
 use url::Url;
 
+use crate::rule_table::TlsInterceptConfig;
 use crate::util::read_to_end;
 
 const MAX_CLIENT_HELLO_SIZE: usize = 64 * 1024;
@@ -84,6 +87,7 @@ enum RouteTarget {
 struct RouteSelection {
   target: RouteTarget,
   fwmark: u32,
+  tls_intercept: Option<TlsInterceptConfig>,
 }
 
 impl ProxyContext {
@@ -97,6 +101,7 @@ impl ProxyContext {
       .as_ref()
       .map(|rule| rule.fwmark)
       .unwrap_or(self.default_fwmark);
+    let tls_intercept = overrides.as_ref().and_then(|r| r.tls_intercept.clone());
     let target = match overrides {
       Some(rule) => {
         if let Some(addr) = rule.direct {
@@ -110,7 +115,11 @@ impl ProxyContext {
       }
       None => RouteTarget::Resolve(self.default_resolver.clone()),
     };
-    RouteSelection { target, fwmark }
+    RouteSelection {
+      target,
+      fwmark,
+      tls_intercept,
+    }
   }
 }
 
@@ -240,8 +249,12 @@ async fn handle_client(
   let socket = ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(client.as_raw_fd()) });
   let upstream = if let Some(hostname) = &hello.hostname {
     aeprintln!("{peer_log_label} requested {}", hostname);
-    let RouteSelection { target, fwmark } = ctx.select_route(hostname);
-    match target {
+    let RouteSelection {
+      target,
+      fwmark,
+      tls_intercept,
+    } = ctx.select_route(hostname);
+    let upstream = match target {
       RouteTarget::Direct(addr) => connect_with_mark(addr, fwmark).await?,
       RouteTarget::Resolve(resolver_url) => {
         let candidates = ctx
@@ -256,7 +269,23 @@ async fn handle_client(
 
         connect_to_any(&candidates, fwmark).await?
       }
+    };
+
+    if let Some(intercept_cfg) = tls_intercept {
+      let should_intercept = match intercept_cfg.match_fwmark {
+        Some(required_mark) => socket.mark().unwrap_or(0) == required_mark,
+        None => true,
+      };
+      if should_intercept {
+        aeprintln!("{peer_log_label} intercepting TLS for {}", hostname);
+        let interceptor = TlsInterceptor::new(&intercept_cfg, hostname).await?;
+        return interceptor
+          .intercept(client, upstream, hello.buffer, hostname)
+          .await;
+      }
     }
+
+    upstream
   } else {
     let local_addr = client.local_addr()?;
     let original_dst = socket

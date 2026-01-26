@@ -41,6 +41,57 @@ The table maps hostname patterns to overrides:
 - `direct` and `resolver` are mutually exclusive for a given rule.
 - Missing fields fall back to the global `--resolver` / `--fwmark` configuration.
 
+## TLS interception
+
+To decrypt and mirror TLS traffic for specific domains, add a `tls_intercept` block:
+
+```json
+{
+  "api.example.com": {
+    "tls_intercept": {
+      "mirror": "127.0.0.1:9000",
+      "ca_cert": "/path/to/ca.crt",
+      "ca_key": "/path/to/ca.key",
+      "match_fwmark": 100
+    }
+  }
+}
+```
+
+Options:
+- `mirror`: TCP address to send decrypted traffic to (required). Use `_:<port>` to mirror to the client's IP address on the specified port.
+- `ca_cert`: Path to CA certificate PEM file (required)
+- `ca_key`: Path to CA private key PEM file (required)
+- `match_fwmark`: Only intercept if the socket's fwmark matches this value (optional)
+
+See `examples/intercept.json` for a complete example.
+
+Generate a CA certificate (P-256 ECDSA):
+
+```bash
+openssl ecparam -genkey -name prime256v1 -out ca_key.pem
+openssl req -new -x509 -days 3650 -key ca_key.pem -out ca_cert.pem -subj "/CN=zerosni CA"
+```
+
+When enabled, zerosni:
+1. Terminates the client TLS connection using a dynamically generated certificate signed by the provided CA
+2. Establishes a new TLS connection to the upstream server
+3. Mirrors decrypted traffic to the specified TCP address
+
+Mirror stream format:
+- Client-to-server chunks: `0x00` + LE32 size + data
+- Server-to-client chunks: `0x01` + LE32 size + data
+
+The CA certificate must be trusted by clients for interception to work transparently.
+
+### Mirror receiver
+
+A helper script `tools/mirror_receiver.py` decodes the mirror stream and prints HTTP/1.1 traffic:
+
+```bash
+python tools/mirror_receiver.py -p 9000
+```
+
 ## Hot reloading
 
 When running with `--rule-table`, send the process `SIGHUP` to reload the JSON

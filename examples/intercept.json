@@ -1,0 +1,9 @@
+{
+    "example.com": {
+        "tls_intercept": {
+            "mirror": "127.0.0.1:5208",
+            "ca_cert": "./ca_cert.pem",
+            "ca_key": "./ca_key.pem"
+        }
+    }
+}
