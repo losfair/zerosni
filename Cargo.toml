@@ -11,10 +11,8 @@ arc-swap = "1"
 compact_str = { version = "0.9", features = ["serde"] }
 dns-parser = "0.8"
 tls-parser = "0.12"
-futures = "0.3"
-monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "utils", "sync", "macros"] }
-monoio-compat = "0.2"
-monoio-rustls = { version = "0.4" }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 libc = "0.2"
@@ -30,7 +28,7 @@ rand = "0.8"
 const-oid = "0.9"
 webpki-roots = "0.26"
 serde = { version = "1", features = ["derive"] }
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 struson = { version = "0.6", features = ["serde"] }
 url = "2"
 moka = { version = "0.12", features = ["future"] }

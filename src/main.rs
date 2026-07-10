@@ -10,9 +10,8 @@ use rule_table::RuleTable;
 use std::{
   collections::{HashMap, HashSet},
   io,
-  mem::ManuallyDrop,
   net::{IpAddr, Ipv4Addr, SocketAddr},
-  os::fd::{AsRawFd, FromRawFd, RawFd},
+  os::fd::{AsRawFd, RawFd},
   path::PathBuf,
   str,
   sync::{
@@ -26,16 +25,14 @@ use tls_intercept::TlsInterceptor;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use moka::future::Cache;
-use monoio::{
-  IoUringDriver,
-  io::{AsyncReadRentExt, AsyncWriteRentExt, Splitable, copy},
-  net::udp::UdpSocket,
-  net::{ListenerOpts, TcpListener, TcpStream},
-};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tls_parser::{
   SNIType, TlsExtension, TlsMessage, TlsMessageHandshake, TlsPlaintext,
   parse_tls_client_hello_extensions, parse_tls_plaintext,
+};
+use tokio::{
+  io::{AsyncReadExt, AsyncWriteExt, copy},
+  net::{TcpListener, TcpStream, UdpSocket},
 };
 use url::Url;
 
@@ -144,12 +141,9 @@ struct ClientHelloCapture {
   buffer: Vec<u8>,
 }
 
-fn main() -> Result<()> {
-  monoio::RuntimeBuilder::<IoUringDriver>::new()
-    .enable_timer()
-    .build()
-    .expect("zerosni: failed to build io_uring runtime")
-    .block_on(amain())
+#[tokio::main]
+async fn main() -> Result<()> {
+  amain().await
 }
 
 async fn amain() -> Result<()> {
@@ -183,7 +177,7 @@ async fn amain() -> Result<()> {
   if let Some(path) = rule_table_path {
     install_rule_table_reloader(rule_table, path);
   }
-  let listener = TcpListener::bind_with_config(args.listen, &ListenerOpts::new().reuse_port(true))?;
+  let listener = bind_listener(args.listen)?;
 
   loop {
     let accepted = listener.accept().await;
@@ -193,7 +187,7 @@ async fn amain() -> Result<()> {
           aeprintln!("failed to set nodelay on accepted stream: {err}");
         }
         let ctx = ctx.clone();
-        monoio::spawn(async move {
+        tokio::spawn(async move {
           if let Err(err) = handle_client(stream, peer, ctx).await {
             aeprintln!("connection from {peer} failed: {err:?}");
           }
@@ -204,6 +198,19 @@ async fn amain() -> Result<()> {
       }
     }
   }
+}
+
+fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+  let domain = match addr {
+    SocketAddr::V4(_) => Domain::IPV4,
+    SocketAddr::V6(_) => Domain::IPV6,
+  };
+  let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+  socket.set_nonblocking(true)?;
+  socket.set_reuse_port(true)?;
+  socket.bind(&addr.into())?;
+  socket.listen(1024)?;
+  TcpListener::from_std(socket.into())
 }
 
 fn install_rule_table_reloader(rule_table: Arc<ArcSwapOption<RuleTable>>, path: PathBuf) {
@@ -246,7 +253,6 @@ async fn handle_client(
   let peer_mac = lookup_peer_mac(peer.ip()).await;
   let peer_log_label = format_peer_with_mac(peer, peer_mac.as_ref().map(|x| &***x));
   let hello = capture_client_hello(&mut client).await?;
-  let socket = ManuallyDrop::new(unsafe { socket2::Socket::from_raw_fd(client.as_raw_fd()) });
   let upstream = if let Some(hostname) = &hello.hostname {
     aeprintln!("{peer_log_label} requested {}", hostname);
     let RouteSelection {
@@ -273,7 +279,7 @@ async fn handle_client(
 
     if let Some(intercept_cfg) = tls_intercept {
       let should_intercept = match intercept_cfg.match_fwmark {
-        Some(required_mark) => socket.mark().unwrap_or(0) == required_mark,
+        Some(required_mark) => SockRef::from(&client).mark().unwrap_or(0) == required_mark,
         None => true,
       };
       if should_intercept {
@@ -288,11 +294,14 @@ async fn handle_client(
     upstream
   } else {
     let local_addr = client.local_addr()?;
-    let original_dst = socket
-      .original_dst()?
-      .as_socket()
-      .with_context(|| "failed to get original_dst ip")?
-      .ip();
+    let socket = SockRef::from(&client);
+    let original_dst = match local_addr {
+      SocketAddr::V4(_) => socket.original_dst_v4()?,
+      SocketAddr::V6(_) => socket.original_dst_v6()?,
+    }
+    .as_socket()
+    .with_context(|| "failed to get original_dst ip")?
+    .ip();
     if original_dst.to_canonical() == local_addr.ip().to_canonical() {
       aeprintln!("{peer_log_label} not bypassing {}", original_dst);
       return Ok(());
@@ -316,8 +325,11 @@ async fn capture_client_hello(stream: &mut TcpStream) -> Result<ClientHelloCaptu
   let mut total = 0usize;
   let peer_addr = stream.peer_addr()?;
 
-  let (hdr_res, header) = stream.read_exact(vec![0u8; 5]).await;
-  hdr_res.context("failed to read TLS record header")?;
+  let mut header = [0u8; 5];
+  stream
+    .read_exact(&mut header)
+    .await
+    .context("failed to read TLS record header")?;
   total += header.len();
   if total > MAX_CLIENT_HELLO_SIZE {
     bail!("TLS ClientHello exceeds {MAX_CLIENT_HELLO_SIZE} bytes");
@@ -332,9 +344,11 @@ async fn capture_client_hello(stream: &mut TcpStream) -> Result<ClientHelloCaptu
     });
   }
   let len = u16::from_be_bytes([header[3], header[4]]) as usize;
-  let (payload_res, payload) = stream.read_exact(vec![0u8; len]).await;
-  let payload = payload;
-  payload_res.context("failed to read TLS record payload")?;
+  let mut payload = vec![0u8; len];
+  stream
+    .read_exact(&mut payload)
+    .await
+    .context("failed to read TLS record payload")?;
   total += len;
   if total > MAX_CLIENT_HELLO_SIZE {
     bail!("TLS ClientHello exceeds {MAX_CLIENT_HELLO_SIZE} bytes");
@@ -363,12 +377,12 @@ fn extract_sni(record: &TlsPlaintext) -> Option<String> {
         for ext in extensions {
           if let TlsExtension::SNI(entries) = ext {
             for (kind, value) in entries {
-              if kind == SNIType::HostName && !value.is_empty() {
-                if let Ok(host) = str::from_utf8(value) {
-                  if host.len() <= 255 {
-                    return Some(host.to_string());
-                  }
-                }
+              if kind == SNIType::HostName
+                && !value.is_empty()
+                && let Ok(host) = str::from_utf8(value)
+                && host.len() <= 255
+              {
+                return Some(host.to_string());
               }
             }
           }
@@ -390,19 +404,17 @@ async fn relay_streams(
 
   let upload = async {
     if let Some(header) = proxy_header {
-      let (res, _buf) = upstream_writer.write_all(header).await;
-      res?;
+      upstream_writer.write_all(&header).await?;
     }
     if !initial.is_empty() {
-      let (res, _buf) = upstream_writer.write_all(initial).await;
-      res?;
+      upstream_writer.write_all(&initial).await?;
     }
     copy(&mut client_reader, &mut upstream_writer).await
   };
 
   let download = async { copy(&mut upstream_reader, &mut client_writer).await };
 
-  let res = monoio::select! {
+  let res = tokio::select! {
     x = upload => x,
     x = download => x,
   };
@@ -445,28 +457,6 @@ fn build_proxy_header(mut src: SocketAddr, mut dst: SocketAddr) -> Vec<u8> {
   }
 }
 
-#[cfg(test)]
-mod proxy_tests {
-  use super::build_proxy_header;
-  use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-
-  #[test]
-  fn builds_ipv4_proxy_header() {
-    let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1234));
-    let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 443));
-    let header = build_proxy_header(src, dst);
-    assert_eq!(header, b"PROXY TCP4 10.0.0.1 203.0.113.10 1234 443\r\n");
-  }
-
-  #[test]
-  fn builds_ipv6_proxy_header() {
-    let src = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5555, 0, 0));
-    let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8443, 0, 0));
-    let header = build_proxy_header(src, dst);
-    assert_eq!(header, b"PROXY TCP6 ::1 ::1 5555 8443\r\n");
-  }
-}
-
 impl DnsClient {
   fn new() -> Result<Self> {
     let cache = &*Box::leak(Box::new(
@@ -479,19 +469,19 @@ impl DnsClient {
     std::thread::Builder::new()
       .name("zerosni-gc".into())
       .spawn(move || {
-        let mut rt = monoio::RuntimeBuilder::<IoUringDriver>::new()
-          .enable_timer()
+        tokio::runtime::Builder::new_current_thread()
+          .enable_time()
           .build()
-          .expect("zerosni-gc: failed to build io_uring runtime");
-        rt.block_on(async {
-          loop {
-            monoio::time::sleep(Duration::from_secs(5)).await;
-            cache.run_pending_tasks().await;
-            unsafe {
-              libc::malloc_trim(0);
+          .expect("zerosni-gc: failed to build Tokio runtime")
+          .block_on(async {
+            loop {
+              tokio::time::sleep(Duration::from_secs(5)).await;
+              cache.run_pending_tasks().await;
+              unsafe {
+                libc::malloc_trim(0);
+              }
             }
-          }
-        })
+          });
       })
       .expect("failed to spawn zerosni-gc");
 
@@ -592,18 +582,17 @@ impl DnsClient {
     let std_socket: std::net::UdpSocket = socket.into();
     std_socket.set_nonblocking(true)?;
     let udp = UdpSocket::from_std(std_socket)?;
-    let mut payload = payload;
     let send_loop = async {
       loop {
-        let (_, buf) = udp.send_to(payload, addr).await;
-        payload = buf;
-        monoio::time::sleep(Duration::from_secs(1)).await;
+        let _ = udp.send_to(&payload, addr).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
       }
     };
-    let (read_res, buf) = monoio::time::timeout(Duration::from_secs(5), async {
-      monoio::select! {
-        x = udp.recv_from(vec![0u8; MAX_DNS_MESSAGE_SIZE]) => x,
-        x = send_loop => x
+    let mut buf = vec![0u8; MAX_DNS_MESSAGE_SIZE];
+    let read_res = tokio::time::timeout(Duration::from_secs(5), async {
+      tokio::select! {
+        x = udp.recv_from(&mut buf) => x,
+        _ = send_loop => unreachable!("DNS retransmission loop does not complete"),
       }
     })
     .await
@@ -718,8 +707,7 @@ async fn connect_to_any(candidates: &[IpAddr], fwmark: u32) -> Result<TcpStream>
       Err(err) => last_err = Some(err),
     }
   }
-  let err = last_err
-    .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to connect to resolved host"));
+  let err = last_err.unwrap_or_else(|| io::Error::other("failed to connect to resolved host"));
   Err(err.into())
 }
 
@@ -730,23 +718,22 @@ async fn connect_with_mark(addr: SocketAddr, fwmark: u32) -> io::Result<TcpStrea
   };
   let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
   socket.set_nonblocking(true)?;
-  socket.set_nodelay(true)?;
+  socket.set_tcp_nodelay(true)?;
   if fwmark != 0 {
     socket.set_mark(fwmark)?;
   }
   let sock_addr = socket2::SockAddr::from(addr);
-  if let Err(err) = socket.connect(&sock_addr) {
-    if err.kind() != io::ErrorKind::WouldBlock
-      && err.kind() != io::ErrorKind::Interrupted
-      && err.raw_os_error() != Some(libc::EINPROGRESS)
-    {
-      return Err(err);
-    }
+  if let Err(err) = socket.connect(&sock_addr)
+    && err.kind() != io::ErrorKind::WouldBlock
+    && err.kind() != io::ErrorKind::Interrupted
+    && err.raw_os_error() != Some(libc::EINPROGRESS)
+  {
+    return Err(err);
   }
   let std_stream: std::net::TcpStream = socket.into();
   std_stream.set_nonblocking(true)?;
   let stream = TcpStream::from_std(std_stream)?;
-  stream.writable(true).await?;
+  stream.writable().await?;
   check_connect_error(stream.as_raw_fd())?;
   Ok(stream)
 }
@@ -803,7 +790,7 @@ async fn lookup_peer_mac(addr: IpAddr) -> Option<Arc<String>> {
 async fn lookup_mac_from_arp(needle: std::net::Ipv4Addr) -> Option<String> {
   let contents = String::from_utf8(read_to_end("/proc/net/arp").await.ok()?).ok()?;
   for line in contents.lines().skip(1) {
-    let mut fields = line.split_whitespace().into_iter();
+    let mut fields = line.split_whitespace();
     let Some(ip) = fields.next().and_then(|x| x.parse::<Ipv4Addr>().ok()) else {
       continue;
     };
@@ -820,4 +807,93 @@ async fn lookup_mac_from_arp(needle: std::net::Ipv4Addr) -> Option<String> {
     }
   }
   None
+}
+
+#[cfg(test)]
+mod proxy_tests {
+  use super::{DnsClient, build_proxy_header, relay_streams};
+  use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+  use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    time::{Duration, timeout},
+  };
+
+  async fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    (client.unwrap(), accepted.unwrap().0)
+  }
+
+  #[test]
+  fn builds_ipv4_proxy_header() {
+    let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1234));
+    let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 443));
+    let header = build_proxy_header(src, dst);
+    assert_eq!(header, b"PROXY TCP4 10.0.0.1 203.0.113.10 1234 443\r\n");
+  }
+
+  #[test]
+  fn builds_ipv6_proxy_header() {
+    let src = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5555, 0, 0));
+    let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8443, 0, 0));
+    let header = build_proxy_header(src, dst);
+    assert_eq!(header, b"PROXY TCP6 ::1 ::1 5555 8443\r\n");
+  }
+
+  #[tokio::test]
+  async fn relays_initial_data_proxy_header_and_both_directions() {
+    let (mut client, proxy_client) = tcp_pair().await;
+    let (mut upstream, proxy_upstream) = tcp_pair().await;
+    let relay = tokio::spawn(relay_streams(
+      proxy_client,
+      proxy_upstream,
+      b"hello".to_vec(),
+      Some(b"proxy".to_vec()),
+    ));
+
+    let mut initial = [0u8; 10];
+    timeout(Duration::from_secs(5), upstream.read_exact(&mut initial))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(&initial, b"proxyhello");
+
+    client.write_all(b"upload").await.unwrap();
+    let mut upload = [0u8; 6];
+    upstream.read_exact(&mut upload).await.unwrap();
+    assert_eq!(&upload, b"upload");
+
+    upstream.write_all(b"download").await.unwrap();
+    let mut download = [0u8; 8];
+    client.read_exact(&mut download).await.unwrap();
+    assert_eq!(&download, b"download");
+
+    drop(client);
+    drop(upstream);
+    timeout(Duration::from_secs(5), relay)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap();
+  }
+
+  #[tokio::test]
+  async fn sends_dns_query_and_accepts_reply_from_configured_resolver() {
+    let resolver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let resolver_addr = resolver.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+      let mut buf = [0u8; 32];
+      let (len, peer) = resolver.recv_from(&mut buf).await.unwrap();
+      assert_eq!(&buf[..len], b"query");
+      resolver.send_to(b"response", peer).await.unwrap();
+    });
+
+    let response = DnsClient::send_single_query(resolver_addr, b"query".to_vec(), 0)
+      .await
+      .unwrap();
+    assert_eq!(response, b"response");
+    server.await.unwrap();
+  }
 }

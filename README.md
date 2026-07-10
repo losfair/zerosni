@@ -1,10 +1,11 @@
 # zerosni
 
-`io_uring`-based SNI-inspecting TCP transparent proxy. It decodes outgoing TCP streams on port 443, resolves the SNI hostname through the provided UDP resolver, and proxies the stream to the resolved host.
+Tokio-based SNI-inspecting TCP transparent proxy. It decodes outgoing TCP streams on port 443, resolves the SNI hostname through the provided UDP resolver, and proxies the stream to the resolved host.
 
 ## Dependencies
 
-- `monoio`: the `io_uring` runtime
+- `tokio`: the asynchronous runtime
+- `tokio-rustls`: asynchronous TLS support for interception
 - [tls-parser](https://crates.io/crates/tls-parser): TLS protocol decoder
 - `dns-parser`: DNS query builder/parser for UDP lookups
 - `clap`: Argument parser (use derive macro)

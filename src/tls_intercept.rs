@@ -1,19 +1,28 @@
-use std::{io, sync::Arc, sync::OnceLock, time::Duration};
+use std::{
+  io,
+  pin::Pin,
+  sync::Arc,
+  sync::OnceLock,
+  task::{Context as TaskContext, Poll},
+  time::Duration,
+};
 
 use anyhow::{Context, Result};
 use moka::future::Cache;
-use monoio::{
-  BufResult,
-  buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut},
-  io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Split, Splitable},
-  net::TcpStream,
-};
-use monoio_rustls::{ServerTlsStream, TlsConnector};
 use rustls::{
   ClientConfig, RootCertStore, ServerConfig,
   pki_types::{CertificateDer, PrivateKeyDer, ServerName},
   server::ResolvesServerCert,
   sign::CertifiedKey,
+};
+use tokio::{
+  io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+  net::TcpStream,
+  sync::Mutex,
+};
+use tokio_rustls::{
+  TlsAcceptor, TlsConnector, client::TlsStream as ClientTlsStream,
+  server::TlsStream as ServerTlsStream,
 };
 
 use crate::rule_table::{MirrorAddr, TlsInterceptConfig};
@@ -38,46 +47,40 @@ impl PrefixedStream {
   }
 }
 
-impl AsyncReadRent for PrefixedStream {
-  async fn read<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
+impl AsyncRead for PrefixedStream {
+  fn poll_read(
+    mut self: Pin<&mut Self>,
+    cx: &mut TaskContext<'_>,
+    buf: &mut ReadBuf<'_>,
+  ) -> Poll<io::Result<()>> {
     let remaining = self.prefix.len() - self.pos;
     if remaining > 0 {
-      let to_copy = remaining.min(buf.bytes_total());
-      let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), to_copy) };
-      slice.copy_from_slice(&self.prefix[self.pos..self.pos + to_copy]);
+      let to_copy = remaining.min(buf.remaining());
+      buf.put_slice(&self.prefix[self.pos..self.pos + to_copy]);
       self.pos += to_copy;
-      unsafe { buf.set_init(to_copy) };
-      return (Ok(to_copy), buf);
+      return Poll::Ready(Ok(()));
     }
-    self.inner.read(buf).await
-  }
-
-  async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
-    // monoio-rustls does not use readv for reading client hello
-    // Delegate to inner stream for vectored reads (prefix should be consumed during handshake)
-    self.inner.readv(buf).await
+    Pin::new(&mut self.inner).poll_read(cx, buf)
   }
 }
 
-impl AsyncWriteRent for PrefixedStream {
-  async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-    self.inner.write(buf).await
+impl AsyncWrite for PrefixedStream {
+  fn poll_write(
+    mut self: Pin<&mut Self>,
+    cx: &mut TaskContext<'_>,
+    buf: &[u8],
+  ) -> Poll<io::Result<usize>> {
+    Pin::new(&mut self.inner).poll_write(cx, buf)
   }
 
-  async fn writev<T: IoVecBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-    self.inner.writev(buf).await
+  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.inner).poll_flush(cx)
   }
 
-  async fn flush(&mut self) -> std::io::Result<()> {
-    self.inner.flush().await
-  }
-
-  async fn shutdown(&mut self) -> std::io::Result<()> {
-    self.inner.shutdown().await
+  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.inner).poll_shutdown(cx)
   }
 }
-
-unsafe impl Split for PrefixedStream {}
 
 pub struct TlsInterceptor {
   server_config: Arc<ServerConfig>,
@@ -115,7 +118,7 @@ impl TlsInterceptor {
     client_hello: Vec<u8>,
     hostname: &str,
   ) -> Result<()> {
-    let acceptor = monoio_rustls::TlsAcceptor::from(self.server_config);
+    let acceptor = TlsAcceptor::from(self.server_config);
     let connector = TlsConnector::from(self.client_config);
 
     // Get client address before wrapping the stream
@@ -137,21 +140,19 @@ impl TlsInterceptor {
 
 async fn relay_intercepted(
   client: ServerTlsStream<PrefixedStream>,
-  upstream: monoio_rustls::ClientTlsStream<TcpStream>,
+  upstream: ClientTlsStream<TcpStream>,
   mirror: TcpStream,
 ) -> Result<()> {
-  let (mut client_r, mut client_w) = client.into_split();
-  let (mut upstream_r, mut upstream_w) = upstream.into_split();
+  let (mut client_r, mut client_w) = tokio::io::split(client);
+  let (mut upstream_r, mut upstream_w) = tokio::io::split(upstream);
   let (mut mirror_r, mirror_w) = mirror.into_split();
-  let mirror_w = Arc::new(futures::lock::Mutex::new(mirror_w));
+  let mirror_w = Arc::new(Mutex::new(mirror_w));
 
   let mw1 = mirror_w.clone();
   let upload = async move {
     let mut buf = vec![0u8; 16384];
     loop {
-      let (res, b) = client_r.read(buf).await;
-      buf = b;
-      let n = match res {
+      let n = match client_r.read(&mut buf).await {
         Ok(0) => break Ok::<_, io::Error>(()),
         Ok(n) => n,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
@@ -164,13 +165,10 @@ async fn relay_intercepted(
       frame.extend_from_slice(&buf[..n]);
       {
         let mut guard = mw1.lock().await;
-        let _ = guard.write_all(frame).await;
+        let _ = guard.write_all(&frame).await;
       }
 
-      let slice = buf.slice(..n);
-      let (res, slice) = upstream_w.write_all(slice).await;
-      buf = slice.into_inner();
-      res?;
+      upstream_w.write_all(&buf[..n]).await?;
     }
   };
 
@@ -178,9 +176,7 @@ async fn relay_intercepted(
   let download = async move {
     let mut buf = vec![0u8; 16384];
     loop {
-      let (res, b) = upstream_r.read(buf).await;
-      buf = b;
-      let n = match res {
+      let n = match upstream_r.read(&mut buf).await {
         Ok(0) => break Ok::<_, io::Error>(()),
         Ok(n) => n,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
@@ -193,20 +189,18 @@ async fn relay_intercepted(
       frame.extend_from_slice(&buf[..n]);
       {
         let mut guard = mw2.lock().await;
-        let _ = guard.write_all(frame).await;
+        let _ = guard.write_all(&frame).await;
       }
 
-      let slice = buf.slice(..n);
-      let (res, slice) = client_w.write_all(slice).await;
-      buf = slice.into_inner();
-      res?;
+      client_w.write_all(&buf[..n]).await?;
     }
   };
 
-  let res = monoio::select! {
+  let mut mirror_probe = [0u8; 1];
+  let res = tokio::select! {
     x = upload => x,
     x = download => x,
-    _ = mirror_r.read(vec![0u8; 1]) => Ok(()),
+    _ = mirror_r.read(&mut mirror_probe) => Ok(()),
   };
   match res {
     Ok(_) => {}
@@ -237,10 +231,10 @@ async fn load_ca(ca_cert_path: &str, ca_key_path: &str) -> Result<Ca> {
   use p256::pkcs8::DecodePrivateKey;
   use sec1::DecodeEcPrivateKey;
 
-  let ca_cert_pem = monoio::fs::read(ca_cert_path)
+  let ca_cert_pem = tokio::fs::read(ca_cert_path)
     .await
     .with_context(|| format!("failed to read CA cert: {}", ca_cert_path))?;
-  let ca_key_pem = monoio::fs::read(ca_key_path)
+  let ca_key_pem = tokio::fs::read(ca_key_path)
     .await
     .with_context(|| format!("failed to read CA key: {}", ca_key_path))?;
 
@@ -356,5 +350,34 @@ struct SingleCertResolver(Arc<CertifiedKey>);
 impl ResolvesServerCert for SingleCertResolver {
   fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
     Some(self.0.clone())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::PrefixedStream;
+  use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+  };
+
+  #[tokio::test]
+  async fn prefixed_stream_replays_prefix_then_delegates_io() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let client = client.unwrap();
+    let mut peer = accepted.unwrap().0;
+    let mut stream = PrefixedStream::new(b"prefix".to_vec(), client);
+
+    peer.write_all(b"socket").await.unwrap();
+    let mut read = [0u8; 12];
+    stream.read_exact(&mut read).await.unwrap();
+    assert_eq!(&read, b"prefixsocket");
+
+    stream.write_all(b"reply").await.unwrap();
+    let mut reply = [0u8; 5];
+    peer.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"reply");
   }
 }
